@@ -16,19 +16,13 @@ You need Python 3. On macOS or Linux run:
 ./run_lyra
 ```
 
-Lyra long v2 demo has its own decoder. On macOS or Linux run:
+For the long v2 demo:
 
 ```shell
 ./run_lyra_long_v2_demo
 ```
 
-On Windows run:
-
-```bat
-run_lyra.bat
-```
-
-or `run_lyra_long_v2_demo.bat` for the lyra long v2 demo decoder.
+On Windows use `run_lyra.bat` or `run_lyra_long_v2_demo.bat`.
 
 The first start can take a while because it installs the needed packages.
 
@@ -70,7 +64,7 @@ Lyra sets the radio to 14.1064 MHz USB and asks for a 6 kHz filter. PTT is contr
 
 To test without a radio, open Lyra twice and connect both windows with a virtual audio cable. BlackHole can be used on macOS and VB-Cable can be used on Windows. Keep the rig option on Test.
 
-The example qso wavs folder has Lyra F, Lyra L and lyra long v2 demo QSO files which can be opened in SDR++. Open the long v2 wav in `./run_lyra_long_v2_demo` (File → Open WAV).
+The example qso wavs folder has some example QSOs you can open in SDR++. For the long v2 one, run `./run_lyra_long_v2_demo` and open the wav from the file menu.
 
 ## license
 
