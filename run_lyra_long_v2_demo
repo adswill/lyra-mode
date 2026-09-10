@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+cd "$ROOT"
+if [[ ! -x .venv/bin/python ]]; then
+  python3 -m venv .venv
+fi
+.venv/bin/pip install -q -r requirements.txt
+export PYTHONPATH="$ROOT"
+exec .venv/bin/python -m lyra.long_v2_demo "$@"

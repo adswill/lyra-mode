@@ -114,14 +114,15 @@ def _snr_db(audio: np.ndarray, fa: float | None = None, fb: float | None = None)
 
 
 def _jt_colormap() -> pg.ColorMap:
-    stops = np.array([0.00, 0.12, 0.32, 0.55, 0.78, 1.00])
+    stops = np.array([0.00, 0.14, 0.32, 0.50, 0.70, 0.86, 1.00])
     colors = np.array(
         [
-            [0, 0, 0],
-            [20, 20, 20],
-            [55, 55, 55],
-            [100, 100, 100],
-            [170, 170, 170],
+            [0, 0, 48],
+            [0, 50, 190],
+            [0, 180, 230],
+            [20, 210, 70],
+            [255, 230, 0],
+            [255, 150, 0],
             [255, 255, 255],
         ],
         dtype=np.float64,
