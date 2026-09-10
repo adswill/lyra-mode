@@ -36,6 +36,16 @@ Manual makes one QSO and then stops.
 
 The power slider changes the audio output level. Start it low when using a radio so it does not clip.
 
+## how it looks
+
+Lyra F
+
+![Lyra F](images/lyra_f.png)
+
+Lyra L
+
+![Lyra L](images/lyra_l.png)
+
 ## channels
 
 The dial frequency is 14.1064 MHz USB. Channels 1 to 5 are Lyra F and channels 6 to 10 are Lyra L. The selected channel is only your transmit channel because the decoder listens to all 10.
