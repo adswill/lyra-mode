@@ -1,0 +1,31 @@
+
+SAMPLE_RATE = 48_000
+TONE_A_HZ = 1_460.0
+TONE_B_HZ = 1_540.0
+PIN_HZ = 1_500.0
+
+
+CHANNEL_STEP_HZ = 500.0
+CHANNELS: tuple[tuple[float, float], ...] = tuple(
+    (460.0 + k * CHANNEL_STEP_HZ, 540.0 + k * CHANNEL_STEP_HZ) for k in range(10)
+)
+CHANNEL_MODES: tuple[str, ...] = ("F",) * 5 + ("L",) * 5
+PIN_GAIN = 0.0
+RF_DIAL_HZ = 14_106_400.0
+
+CHIRP_LO_HZ = 1_400.0
+CHIRP_HI_HZ = 1_600.0
+CHIRP_S = 0.22  
+
+BIT_RATE = 50.0  
+BT = 0.3
+MOD_INDEX = 0.5  
+COSTAS = (1, 1, 0, 1, 0, 0, 1, 0)
+
+INFO_BITS = 77  
+CRC_BITS = 16
+CONV_TAIL = 6
+CAPTURE_S = 18.0
+SPACING_HZ = 80.0
+CODED_BITS = 2 * (INFO_BITS + CRC_BITS + CONV_TAIL)
+FRAME_BITS = 8 + CODED_BITS
