@@ -1,6 +1,6 @@
 # Lyra
 
-(I do want heavily emphasise that this is still a work in progress and there will be bugs and issues, but just dm them to me or put it in the issue tab and I will have a look at it. User: plutobypluto for dc)
+(I do want heavily emphasise that this is still a work in progress and there will be bugs and issues, but just dm them to me or put it in the issue tab and I will have a look at it. User: plutobypluto for dc. I also do a devlog here https://www.youtube.com/@ads_will1)
 
 Lyra is an experimental digital radio mode for the 20m amateur band. It uses two GMSK rails which are 80 Hz apart and each message starts with a chirp. This makes it look and sound different from normal FT8.
 
