@@ -3,8 +3,13 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 if [[ ! -x .venv/bin/python ]]; then
-  python3 -m venv .venv
+  python3 -m venv .venv >/dev/null 2>&1
 fi
-.venv/bin/pip install -q -r requirements.txt
+SITE="$(".venv/bin/python" -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
+if [[ ! -e "$SITE/PySide6" ]]; then
+  .venv/bin/python first_install.py requirements.txt
+else
+  .venv/bin/pip install -q -r requirements.txt
+fi
 export PYTHONPATH="$ROOT"
 exec .venv/bin/python -m lyra "$@"
