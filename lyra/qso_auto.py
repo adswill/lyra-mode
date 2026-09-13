@@ -5,7 +5,21 @@ from dataclasses import dataclass
 import time
 import zlib
 
-from lyra.pack import pack_73, pack_cq, pack_reply, pack_rpt, pack_rr73
+from lyra.pack import pack_73, pack_cq, pack_rpt, pack_rr73
+
+
+def _is_grid(field: str) -> bool:
+    return len(field) == 4 and field[:2].isalpha() and field[2:].isdigit()
+
+
+def _is_rpt(field: str) -> bool:
+    if not field or field[0] not in "+-":
+        return False
+    try:
+        int(field)
+        return True
+    except ValueError:
+        return False
 
 
 @dataclass
@@ -36,7 +50,7 @@ def contention_plan(
     value = zlib.crc32(key)
     return ReplyPlan(
         channel=allowed[value % len(allowed)],
-        delay_ms=100 + ((value >> 8) % 501),
+        delay_ms=0,
     )
 
 
@@ -68,11 +82,18 @@ class AutoQso:
         self.remote_snr = max(-35, min(28, int(round(snr))))
         self._wait("wait_report", now)
         return AutoAction(
-            pack_reply(self.target, self.my_call, self.grid),
-            f"{self.target} {self.my_call} {self.grid}",
+            pack_rpt(self.target, self.my_call, self.remote_snr, False),
+            f"{self.target} {self.my_call} {self.remote_snr:+03d}",
         )
 
-    def begin_accept(self, call: str, snr: int, *, now: float | None = None) -> AutoAction | None:
+    def begin_accept(
+        self,
+        call: str,
+        snr: int,
+        *,
+        now: float | None = None,
+        roger: bool = False,
+    ) -> AutoAction | None:
         if self.operation == self.ANSWER_CQ or self.state != "calling":
             return None
         target = str(call).strip().upper()
@@ -82,6 +103,13 @@ class AutoQso:
         report = max(-35, min(28, int(round(snr))))
         self.target = target
         self.remote_snr = report
+        if roger:
+            self._wait("wait_73", now)
+            tag = f"R{report:+03d}"
+            return AutoAction(
+                pack_rpt(self.target, self.my_call, report, True),
+                f"{self.target} {self.my_call} {tag}",
+            )
         self._wait("wait_r_report", now)
         return AutoAction(
             pack_rpt(self.target, self.my_call, report, False),
@@ -121,17 +149,15 @@ class AutoQso:
             if self.state == "listening" and first == "CQ" and second != self.my_call:
                 return self.begin_answer(second, report, now=now)
             if self.state == "wait_report" and first == self.my_call and second == self.target:
-                if field.startswith(("+", "-")):
-                    self._wait("wait_rr73", now)
-                    tag = f"R{self.remote_snr:+03d}"
+                if _is_rpt(field) or field.startswith(("R+", "R-")):
+                    self.state = "complete"
+                    self.deadline = 0.0
                     return AutoAction(
-                        pack_rpt(self.target, self.my_call, self.remote_snr, True),
-                        f"{self.target} {self.my_call} {tag}",
+                        pack_rr73(self.target, self.my_call),
+                        f"{self.target} {self.my_call} RR73",
                     )
-            
-            
             if self.state == "wait_report" and second == self.target and first != self.my_call:
-                if field.startswith(("+", "-")):
+                if _is_rpt(field) or field.startswith(("R+", "R-")):
                     self.target = ""
                     self.state = "listening"
                     self.deadline = 0.0
@@ -146,8 +172,10 @@ class AutoQso:
             return None
 
         if self.state == "calling" and first == self.my_call and second != self.my_call:
-            if len(field) == 4 and field[:2].isalpha() and field[2:].isdigit():
+            if _is_grid(field):
                 return self.begin_accept(second, report, now=now)
+            if _is_rpt(field):
+                return self.begin_accept(second, report, now=now, roger=True)
         if self.state == "wait_r_report" and first == self.my_call and second == self.target:
             if field.startswith("R+") or field.startswith("R-"):
                 self._wait("wait_73", now)
@@ -156,6 +184,13 @@ class AutoQso:
                     f"{self.target} {self.my_call} RR73",
                 )
         if self.state == "wait_73" and first == self.my_call and second == self.target:
+            if field in ("RR73", "RRR"):
+                self.state = "complete"
+                self.deadline = 0.0
+                return AutoAction(
+                    pack_73(self.target, self.my_call),
+                    f"{self.target} {self.my_call} 73",
+                )
             if field == "73":
                 self.state = "complete"
                 self.deadline = 0.0

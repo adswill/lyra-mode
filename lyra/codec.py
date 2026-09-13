@@ -375,11 +375,13 @@ def _drop_harmonics(pairs: list[tuple[float, float]]) -> list[tuple[float, float
     return out
 
 
-def decode_usb_all(audio: np.ndarray, block: np.ndarray | None = None) -> list[dict]:
+def decode_usb_all(
+    audio: np.ndarray, block: np.ndarray | None = None, *, live: bool = False
+) -> list[dict]:
     global LAST_STATUS
     from lyra import rx
 
-    rows = rx.decode_many(audio)
+    rows = rx.decode_many(audio, live=live)
     LAST_STATUS = rx.LAST_STATUS
     return rows
 

@@ -106,6 +106,7 @@ class AudioTap:
         self._ring = np.zeros(1, dtype=np.float32)
         self._w = 0
         self._n = 0
+        self._seq = 0
 
     def start(self) -> None:
         sd = load_sounddevice()
@@ -134,6 +135,7 @@ class AudioTap:
         self._ring = np.zeros(n, dtype=np.float32)
         self._w = 0
         self._n = 0
+        self._seq = 0
         self.overruns = 0
 
         def callback(indata, frames, time_info, status) -> None:
@@ -155,17 +157,29 @@ class AudioTap:
                     buf[: k - a] = mono[a:]
                 self._w = (w + k) % cap
                 self._n = min(cap, self._n + k)
+                self._seq += k
 
-        self._stream = sd.InputStream(
-            device=dev,
-            samplerate=self.capture_rate,
-            channels=self.channels,
-            dtype="float32",
-            blocksize=2048,
-            latency=2.0,
-            callback=callback,
-        )
-        self._stream.start()
+        try:
+            self._stream = sd.InputStream(
+                device=dev,
+                samplerate=self.capture_rate,
+                channels=self.channels,
+                dtype="float32",
+                blocksize=256,
+                latency="low",
+                callback=callback,
+            )
+            self._stream.start()
+        except Exception:
+            self._stream = sd.InputStream(
+                device=dev,
+                samplerate=self.capture_rate,
+                channels=self.channels,
+                dtype="float32",
+                blocksize=512,
+                callback=callback,
+            )
+            self._stream.start()
 
     def stop(self) -> None:
         if self._stream is not None:
@@ -218,6 +232,16 @@ class AudioTap:
                     native[a:] = self._ring[: take - a]
         audio = _resample_48k(native, self.capture_rate)
         return audio[-n:] if len(audio) >= n else audio
+
+    def captured(self) -> int:
+        with self._lock:
+            return int(self._seq)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._ring.fill(0)
+            self._w = 0
+            self._n = 0
 
     def rms(self) -> float:
         audio = self.latest(SAMPLE_RATE)

@@ -6,8 +6,6 @@ Lyra is an experimental digital radio mode for the amateur HF bands. It uses two
 
 There are two modes. Lyra F is the faster one (~2.3 s) and splits the message between the two rails. The chirp goes high to low. Lyra L is longer (~4.3 s) and sends the same data on both rails which can help if one rail is affected by fading. The chirp goes low to high. The chirp direction is what marks F vs L, not the channel.
 
-This is still experimental and I have mostly tested it using virtual audio cables, not a real radio.
-
 ## running
 
 You need Python 3. On macOS or Linux run:
@@ -34,9 +32,9 @@ The frequency box on the top bar is the USB dial. Pick 20m, 30m, or 15m, or type
 
 Monitor listens to the sound card. Decode turns the decoder on. Leave both on for normal use. max ch is how many channels the decoder will look at (up to 10).
 
-Auto calls CQ and keeps making QSOs until you press stop. After a CQ it listens for about 4 s before calling again.
+Auto calls CQ and keeps making QSOs until you press stop. After a CQ it waits 5 s, then CQs again unless a reply starts a QSO.
 
-Answer only answers other stations calling CQ. It replies in the same mode as the CQ it heard, and it tries to key inside that 4 s window.
+Answer takes the first usable CQ right away, including ones already in the activity list, so you do not have to wait for the next CQ. Set channel to a free hole first (the channels list shows busy vs ok). That is your reply channel, not the CQ's channel.
 
 Manual makes one QSO and then stops.
 
@@ -65,18 +63,6 @@ Lyra F
 Lyra L
 
 ![Lyra L](images/lyra_l.png)
-
-## channels
-
-USB dial presets are 20m 14.1064 MHz, 30m 10.1440 MHz, and 15m 21.1100 MHz. You can also type a custom USB dial in the frequency dropdown. F and L can use any of the 10 channels. All 10 channels sit inside a normal USB voice filter (about 380–2350 Hz audio). Channel 6 is around 1.5 kHz, not 3 kHz. The selected channel is only your transmit channel because the decoder listens to all 10. Auto answers use channels 1–5 so they stay in the middle of a typical SSB filter.
-
-Transmit is one channel (two rails 80 Hz apart). The full 10-channel listen window is about 2 kHz above the dial, so on 20m that is about 14.1068 to 14.1088 MHz. These frequencies are not reserved for Lyra. Check that the channel is free and follow your local band rules before transmitting.
-
-The 20m preset sits in the IARU all-mode digital area above the 14.099–14.101 beacons, not on FT8 14.074 or FT4 14.080. It is next to the 14.105 Olivia/packet watering hole, so listen first.
-
-The 15m preset is 21.1100 MHz so the 10-channel window stays in the IARU Region 1 21.110–21.120 all-mode digital slice, below the 21.149–21.151 beacons and away from FT8 21.074 and FT4 21.140.
-
-30m is a narrow secondary band. IARU Region 1 allows only 500 Hz-wide emissions in 10.130–10.150, and many places do not allow SSB there. Lyra transmit is one channel, but 30m is crowded: FT8 10.136, FT4/WSPR 10.140, JS8 10.130, RTTY/Olivia around 10.142, packet 10.147, APRS near 10.149. The 10.1440 preset puts the 10-channel window around 10.1444–10.1464, above those FT8/FT4 dials and below packet/APRS.
 
 ## radio
 

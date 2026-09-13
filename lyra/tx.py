@@ -119,7 +119,7 @@ class TxSession:
         try:
             rig.set_ptt(True)
             callback("PTT ON", False)
-            if self._stop.wait(0.10):
+            if self._stop.wait(0.02):
                 return
             if output_device is None:
                 
@@ -133,16 +133,16 @@ class TxSession:
                     samplerate=SAMPLE_RATE,
                     channels=1,
                     dtype="float32",
-                    blocksize=2048,
-                    latency="high",
+                    blocksize=512,
+                    latency="low",
                 )
                 with self._lock:
                     self._stream = stream
                 stream.start()
-                for pos in range(0, len(audio), 2048):
+                for pos in range(0, len(audio), 512):
                     if self._stop.is_set():
                         break
-                    stream.write(audio[pos : pos + 2048].reshape(-1, 1))
+                    stream.write(audio[pos : pos + 512].reshape(-1, 1))
                 stream.stop()
                 stream.close()
                 with self._lock:

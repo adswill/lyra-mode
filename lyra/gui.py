@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 
+import random
 import sys
 import tempfile
 import threading
@@ -14,7 +15,7 @@ import numpy as np
 from lyra.capture import AudioTap, default_input_index, list_inputs, load_sounddevice
 from lyra.codec import decode_usb_all, heartbeat_bits
 from lyra import codec as lyra_codec
-from lyra.qso_auto import AutoAction, AutoQso, contention_plan
+from lyra.qso_auto import AutoAction, AutoQso, _is_grid, _is_rpt
 from lyra.hamlib import LocalRigctld, bundled_hamlib_dir, find_rigctld, list_models, list_serial_ports
 from lyra.rig import DummyRig, RigctldRig
 from lyra.tx import TxSession, build_tx_audio, list_outputs, write_tx_wav
@@ -36,11 +37,18 @@ VIEW_HI = 2_800.0
 WF_NFFT = 8192
 WF_ROWS = 360
 WF_LEVELS = (-105.0, -55.0)
-LIVE_DECODE_INTERVAL_S = 0.15
+LIVE_DECODE_INTERVAL_S = 0.015
+LIVE_AUDIO_S = 5.2
 UI_RENDER_INTERVAL_S = 0.10
-CQ_PICK_MS = 1400
-CQ_GAP_S = 4.0
-ANSWER_CLEAR_S = 0.18
+CQ_PICK_MS = 5000
+CQ_GAP_S = 5.0
+ANSWER_CLEAR_S = 0.0
+ANSWER_JITTER_S = 0.75
+BUSY_HOLD_S = 8.0
+CHANNEL_HOLD_S = 4.8
+WATCH_ARM_S = 0.35
+DECODE_GRACE_S = 0.45
+ECHO_S = 5.5
 CH_COLORS = ("#777777",) * 5
 from lyra.modem import usb_spectrum
 
@@ -177,14 +185,17 @@ class DecodeWorker(QObject):
         self.last_t = 0.0
         self._seen_rows: dict[tuple, float] = {}
         self.decode_enabled = True
+        self.mute_channel: int | None = None
         self.out_q: SimpleQueue = SimpleQueue()
         self._last_decode = 0.0
+        self._last_seq = -1
 
     def start(self, device: int) -> str:
         self.stop()
         self._seen_rows.clear()
         self.tap = AudioTap(device, seconds=12.0)
         self.tap.start()
+        self._last_seq = -1
         self.running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -200,10 +211,18 @@ class DecodeWorker(QObject):
             self.tap = None
 
     def _push_rows(self, audio: np.ndarray, rows: list) -> None:
+        mute = self.mute_channel
+        mute_mid = None
+        if mute is not None and 1 <= mute <= len(CHANNELS):
+            fa, fb = CHANNELS[mute - 1]
+            mute_mid = 0.5 * (fa + fb)
         for rec in rows:
             got = rec["row"]
             fa = float(rec.get("fa") or 0.0)
             fb = float(rec.get("fb") or 0.0)
+            if mute_mid is not None and fa > 0.0 and fb > 0.0:
+                if abs(0.5 * (fa + fb) - mute_mid) < 110.0:
+                    continue
             mode = str(rec.get("mode") or "")
             now = time.monotonic()
             cq_end = _cq_end_time(now, len(audio), rec.get("i0"), mode)
@@ -220,21 +239,17 @@ class DecodeWorker(QObject):
             self.last_t = now
             kind, a, b = got
             msg = " ".join(p for p in (kind, a, b) if p)
-            self.out_q.put(
-                (
-                    "row",
-                    {
-                        "utc": datetime.now(timezone.utc).strftime("%H%M%S"),
-                        "db": round(_snr_db(audio, fa or None, fb or None), 0),
-                        "fa": fa,
-                        "fb": fb,
-                        "msg": msg,
-                        "decoded": got,
-                        "mode": mode,
-                        "cq_end": cq_end,
-                    },
-                )
-            )
+            payload = {
+                "utc": datetime.now(timezone.utc).strftime("%H%M%S"),
+                "db": round(_snr_db(audio, fa or None, fb or None), 0),
+                "fa": fa,
+                "fb": fb,
+                "msg": msg,
+                "decoded": got,
+                "mode": mode,
+                "cq_end": cq_end,
+            }
+            self.decoded.emit(payload)
 
     def decode_wav(self, path: Path) -> None:
         threading.Thread(target=self._decode_wav, args=(path,), daemon=True).start()
@@ -258,25 +273,28 @@ class DecodeWorker(QObject):
             self.out_q.put(("status", f"decode error: {type(e).__name__}: {e}"))
 
     def _loop(self) -> None:
+        min_new = int(0.012 * SAMPLE_RATE)
         while self.running and self.tap is not None:
-            now = time.monotonic()
-            if not self.decode_enabled or (now - self._last_decode) < LIVE_DECODE_INTERVAL_S:
-                time.sleep(0.02)
+            if not self.decode_enabled:
+                time.sleep(0.005)
                 continue
-            
-            
-            audio = self.tap.latest(6 * SAMPLE_RATE)
+            seq = self.tap.captured()
+            if seq - self._last_seq < min_new:
+                time.sleep(0.001)
+                continue
+            self._last_seq = seq
+            audio = self.tap.latest(int(LIVE_AUDIO_S * SAMPLE_RATE))
             if audio is not None and len(audio) >= int(0.80 * SAMPLE_RATE):
                 rows: list = []
                 try:
-                    rows = decode_usb_all(audio, self.block)
-                    self.out_q.put(("status", lyra_codec.LAST_STATUS or ""))
+                    rows = decode_usb_all(audio, self.block, live=True)
                 except Exception as e:
                     self.out_q.put(("status", f"decode error: {type(e).__name__}"))
                     rows = []
                 self._last_decode = time.monotonic()
                 self._push_rows(audio, rows)
-            time.sleep(0.02)
+            else:
+                time.sleep(0.001)
 
 
 class TxBridge(QObject):
@@ -289,12 +307,16 @@ class LyraWindow(QMainWindow):
         self.setWindowTitle("lyra")
         self.resize(1520, 940)
         self.worker = DecodeWorker()
+        self.worker.decoded.connect(self._on_decode)
         self.tx_session = TxSession()
         self.tx_bridge = TxBridge()
         self.tx_bridge.status.connect(self._on_tx_status)
         self.rig = DummyRig()
+        self._wf = None
+        self._echo_until = 0.0
+        self._echo_msg = ""
+        self._echo_msgs: list[tuple[float, str]] = []
         self._resume_monitor = False
-        self._wf = None  
         self._started = False
         self._syncing = False
         self._ch_spec: list = []
@@ -305,17 +327,28 @@ class LyraWindow(QMainWindow):
         self._channel_rows: dict[int, int] = {}
         self._channel_tones: dict[int, str | None] = {}
         self._channel_mode: dict[int, str] = {}
+        self._channel_heard_at: dict[int, float] = {}
         self._pending_tx_log: tuple[AutoAction, int] | None = None
         self._last_render = 0.0
         self._cq_pool: dict[str, dict] = {}
         self._worked: dict[str, float] = {}
         self._pending_answer: dict | None = None
+        self._radio_hz: int | None = None
+        self._radio_mode: str | None = None
         self._cq_pick_timer = QTimer(self)
         self._cq_pick_timer.setSingleShot(True)
         self._cq_pick_timer.timeout.connect(self._flush_cq_pool)
+        self._cq_repeat_timer = QTimer(self)
+        self._cq_repeat_timer.setSingleShot(True)
+        self._cq_repeat_timer.timeout.connect(self._on_cq_repeat)
+        self._cq_repeat_generation = 0
+        self._watch_channel: int | None = None
+        self._watch_arm_at = 0.0
+        self._watch_hold_until = 0.0
         self._qso_call = ""
         self._build_menu()
         self._build()
+        self._sync_channel_overview(self._channel_grid())
         self._load_devices()
         self._load_outputs()
         self.timer = QTimer(self)
@@ -324,7 +357,11 @@ class LyraWindow(QMainWindow):
         self.clock = QTimer(self)
         self.clock.timeout.connect(self._tick_clock)
         self.clock.start(250)
+        self._watch_timer = QTimer(self)
+        self._watch_timer.timeout.connect(self._fast_watch)
+        self._watch_timer.start(20)
         QTimer.singleShot(400, self._autostart)
+        QTimer.singleShot(500, self._startup_notice)
 
     def _build_menu(self) -> None:
         file_m = self.menuBar().addMenu("&File")
@@ -421,9 +458,10 @@ class LyraWindow(QMainWindow):
     def _apply_dial(self, hz: int) -> None:
         prefs.save_dial(hz)
         self._fill_dial_combo(self.dial)
+        self._radio_hz = None
         if getattr(self.rig, "connected", False):
             try:
-                self.rig.set_frequency(hz)
+                self._prepare_radio()
             except Exception as exc:
                 self.rig_status.setText(str(exc))
 
@@ -574,8 +612,8 @@ class LyraWindow(QMainWindow):
         qso_box.setMinimumHeight(180)
 
         self.rx_cap = QLabel("channels")
-        self.rx_table = QTableWidget(0, 6)
-        self.rx_table.setHorizontalHeaderLabels(["ch", "mode", "hz", "last", "snr", "count"])
+        self.rx_table = QTableWidget(0, 7)
+        self.rx_table.setHorizontalHeaderLabels(["ch", "mode", "hz", "last", "snr", "count", "busy"])
         self.rx_table.verticalHeader().setVisible(False)
         self.rx_table.setShowGrid(False)
         self.rx_table.setAlternatingRowColors(True)
@@ -586,12 +624,14 @@ class LyraWindow(QMainWindow):
         rh.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
         rh.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
         rh.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-        rh.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        rh.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
+        rh.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
         self.rx_table.setColumnWidth(0, 48)
         self.rx_table.setColumnWidth(1, 56)
         self.rx_table.setColumnWidth(2, 110)
         self.rx_table.setColumnWidth(3, 78)
         self.rx_table.setColumnWidth(4, 56)
+        self.rx_table.setColumnWidth(5, 56)
         self.rx_table.verticalHeader().setDefaultSectionSize(24)
         self.rx_table.horizontalHeader().setMinimumHeight(26)
         ch_box = QWidget()
@@ -725,8 +765,12 @@ class LyraWindow(QMainWindow):
         self.tx_stop.setEnabled(False)
         self.tx_stop.clicked.connect(self._stop_tx)
         row.addWidget(self.tx_stop)
+        self.tx_light = QFrame()
+        self.tx_light.setFixedSize(10, 10)
+        row.addWidget(self.tx_light)
         self.tx_status = QLabel("TX off")
         row.addWidget(self.tx_status, 1)
+        self._set_tx_light(False)
 
         
         self.rig_kind = QComboBox()
@@ -761,6 +805,7 @@ class LyraWindow(QMainWindow):
         self.rig_baud.setCurrentText("19200")
         self.rig_pktusb = QCheckBox("packet USB")
         self.rig_pktusb.setChecked(True)
+        self.rig_pktusb.toggled.connect(lambda _on: setattr(self, "_radio_mode", None))
         self.rig_connect = QPushButton("connect")
         self.rig_connect.clicked.connect(self._connect_rig)
         self.rig_status = QLabel("test ready")
@@ -842,11 +887,21 @@ class LyraWindow(QMainWindow):
         for mode, width in ((want, 3000), (want, 6000), ("USB", 3000), ("USB", 6000)):
             try:
                 self.rig.set_mode(mode, width)
+                self._radio_mode = mode
                 return
             except Exception as exc:
                 last = exc
         if last is not None:
             raise last
+
+    def _prepare_radio(self) -> None:
+        hz = self._dial_hz()
+        want = "PKTUSB" if self.rig_pktusb.isChecked() else "USB"
+        if self._radio_hz != hz:
+            self.rig.set_frequency(hz)
+            self._radio_hz = hz
+        if self._radio_mode != want:
+            self._apply_radio_mode()
 
     def _connect_rig(self) -> bool:
         try:
@@ -888,8 +943,9 @@ class LyraWindow(QMainWindow):
                 self._hamlib.stop()
                 self.rig = DummyRig()
             self.rig.connect()
-            self.rig.set_frequency(self._dial_hz())
-            self._apply_radio_mode()
+            self._radio_hz = None
+            self._radio_mode = None
+            self._prepare_radio()
         except Exception as exc:
             self.rig_status.setText("Connection failed")
             QMessageBox.warning(self, "Lyra rig control", str(exc))
@@ -1049,7 +1105,9 @@ class LyraWindow(QMainWindow):
         self._reset_qso_log()
         self._cq_pool.clear()
         self._cq_pick_timer.stop()
+        self._cq_repeat_timer.stop()
         self._pending_answer = None
+        self._clear_channel_watch()
         self._auto_generation = getattr(self, "_auto_generation", 0) + 1
         for control in (
             self.my_call,
@@ -1068,6 +1126,8 @@ class LyraWindow(QMainWindow):
                 self.monitor.setChecked(True)
             if prefs.cq_pick() == prefs.CQ_MANUAL:
                 self.tx_status.setText("pick a CQ")
+            else:
+                self._harvest_activity()
         else:
             self._send_action(action)
             if prefs.cq_pick() == prefs.CQ_MANUAL:
@@ -1077,15 +1137,18 @@ class LyraWindow(QMainWindow):
         if not self.auto_active or self.tx_session.busy:
             return
         try:
-            self.rig.set_frequency(self._dial_hz())
-            self._apply_radio_mode()
+            self._prepare_radio()
             audio = self._make_tx_audio(action)
+            self._tx_label = action.label
+            self._echo_msg = str(action.label or "").strip().upper()
+            self._echo_msgs.append((time.monotonic(), self._echo_msg))
+            self._pending_tx_log = (action, self.tx_channel.value())
+            self.worker.mute_channel = int(self.tx_channel.value())
             self._resume_monitor = self.monitor.isChecked()
             if self._resume_monitor:
                 self.monitor.setChecked(False)
-            self._tx_label = action.label
-            self._pending_tx_log = (action, self.tx_channel.value())
             self.tx_status.setText("TX on")
+            self._set_tx_light(True)
             self.tx_session.start(
                 audio,
                 output_device=self.tx_dev.currentData(),
@@ -1102,9 +1165,17 @@ class LyraWindow(QMainWindow):
         self._pending_tx_log = None
         self._cq_pool.clear()
         self._cq_pick_timer.stop()
+        self._cq_repeat_timer.stop()
         self._pending_answer = None
+        self._clear_channel_watch()
         self._auto_generation = getattr(self, "_auto_generation", 0) + 1
         self.tx_session.stop()
+        self.worker.decode_enabled = self.decode_on.isChecked()
+        self._unmute_tx_channel()
+        if self._resume_monitor:
+            self._resume_monitor = False
+            self.monitor.setChecked(True)
+        self._set_tx_light(False)
         self.tx_status.setText("TX off")
         self.tx_button.setEnabled(True)
         self.tx_stop.setEnabled(False)
@@ -1119,13 +1190,25 @@ class LyraWindow(QMainWindow):
 
     def _on_tx_status(self, message: str, done: bool) -> None:
         if not done:
+            self.worker.decode_enabled = self.decode_on.isChecked()
+            self._set_tx_light(True)
             if self.auto_active:
                 self.tx_status.setText("TX on")
             return
+        self.worker.decode_enabled = self.decode_on.isChecked()
+        self._set_tx_light(False)
+        if self._resume_monitor:
+            self._resume_monitor = False
+            self.monitor.setChecked(True)
+        self._echo_until = time.monotonic() + ECHO_S
+        if self.worker.tap is not None:
+            self.worker.tap.clear()
+        QTimer.singleShot(400, self._unmute_tx_channel)
         pending = self._pending_tx_log
         self._pending_tx_log = None
         if message == "Transmission complete" and pending is not None:
             action, channel = pending
+            self._echo_msg = str(action.label or "").strip().upper()
             fa, fb = CHANNELS[channel - 1]
             self._on_decode(
                 {
@@ -1137,19 +1220,17 @@ class LyraWindow(QMainWindow):
                     "snr_text": "TX",
                 }
             )
-        if self._resume_monitor:
-            self._resume_monitor = False
-            self.monitor.setChecked(True)
         if not self.auto_active or self.auto_qso is None:
             self.tx_status.setText("TX off")
             return
         self.tx_status.setText("TX on")
-        generation = self._auto_generation
         if self.auto_qso.state == "calling":
-            delay = int(CQ_GAP_S * 1000)
-            QTimer.singleShot(delay, lambda: self._auto_continue(generation, False))
+            if pending is not None:
+                self._arm_channel_watch(int(pending[1]))
+            self._schedule_cq_repeat()
         elif self.auto_qso.state == "complete":
-            QTimer.singleShot(2500, lambda: self._auto_continue(generation, True))
+            generation = self._auto_generation
+            QTimer.singleShot(2500, lambda g=generation: self._auto_continue(g, True))
             self._mark_worked(self.auto_qso.target)
 
     def _auto_continue(self, generation: int, completed: bool) -> None:
@@ -1160,11 +1241,150 @@ class LyraWindow(QMainWindow):
             or self.tx_session.busy
         ):
             return
+        if not completed and self._cq_pool:
+            self._flush_cq_pool()
+            if self.tx_session.busy or (self.auto_qso is not None and self.auto_qso.target):
+                return
+        if not completed:
+            if self.auto_qso is not None and self.auto_qso.target:
+                return
+            self._clear_channel_watch()
         action = self.auto_qso.resume() if completed else self.auto_qso.repeat_cq()
         if action is not None:
             self._send_action(action)
         else:
             self.tx_status.setText("TX on")
+
+    def _reply_window_s(self) -> float:
+        return CQ_GAP_S
+
+    def _schedule_cq_repeat(self, delay_s: float | None = None) -> None:
+        if not self.auto_active or self.auto_qso is None or self.auto_qso.target:
+            self._cq_repeat_timer.stop()
+            return
+        self._cq_repeat_generation = self._auto_generation
+        wait = self._reply_window_s() if delay_s is None else float(delay_s)
+        self._cq_repeat_timer.start(max(200, int(wait * 1000)))
+
+    def _on_cq_repeat(self) -> None:
+        if not self.auto_active or self.auto_qso is None:
+            return
+        if self.auto_qso.target or self.tx_session.busy:
+            self._schedule_cq_repeat(0.25)
+            return
+        self._auto_continue(self._cq_repeat_generation, False)
+
+    def _clear_channel_watch(self) -> None:
+        self._watch_channel = None
+        self._watch_arm_at = 0.0
+        self._watch_hold_until = 0.0
+
+    def _arm_channel_watch(self, channel: int) -> None:
+        self._watch_channel = max(1, min(len(CHANNELS), int(channel)))
+        self._watch_arm_at = time.monotonic() + WATCH_ARM_S
+        self._watch_hold_until = 0.0
+
+    def _channel_index(self, fa: float, fb: float) -> int | None:
+        if fa <= 0.0 or fb <= 0.0:
+            return None
+        mid = 0.5 * (fa + fb)
+        idx = min(
+            range(len(CHANNELS)),
+            key=lambda i: abs(mid - 0.5 * (CHANNELS[i][0] + CHANNELS[i][1])),
+        )
+        return idx + 1
+
+    def _channel_energy_busy(self, freqs: np.ndarray, mag: np.ndarray, fa: float, fb: float) -> bool:
+        if freqs is None or mag is None or len(freqs) < 8:
+            return False
+        near = (freqs >= min(fa, fb) - 160.0) & (freqs <= max(fa, fb) + 160.0)
+        rails = (np.abs(freqs - fa) <= 22.0) | (np.abs(freqs - fb) <= 22.0)
+        noise_bins = mag[near & ~rails]
+        if len(noise_bins) < 4:
+            noise_bins = mag
+        noise = float(np.median(noise_bins))
+
+        def peak(f0: float) -> float:
+            mask = np.abs(freqs - f0) <= 18.0
+            if not np.any(mask):
+                return -120.0
+            return float(np.max(mag[mask]))
+
+        pa, pb = peak(fa), peak(fb)
+        return pa >= noise + 9.0 and pb >= noise + 9.0 and abs(pa - pb) <= 12.0
+
+    def _channel_still_busy(self) -> bool:
+        if self._watch_channel is None or self.worker.tap is None:
+            return False
+        sl = self.worker.tap.latest(4096)
+        if sl is None or len(sl) < 1024:
+            return False
+        nfft = 1 << int(np.ceil(np.log2(max(1024, min(len(sl), 4096)))))
+        freqs, mag = usb_spectrum(sl, nfft=nfft)
+        band = (freqs >= VIEW_LO) & (freqs <= VIEW_HI)
+        freqs = freqs[band]
+        mag = np.asarray(mag[band], dtype=np.float32)
+        fa, fb = CHANNELS[self._watch_channel - 1]
+        return self._channel_energy_busy(freqs, mag, fa, fb)
+
+    def _fast_watch(self) -> None:
+        self._try_pending_answer()
+        tap = self.worker.tap
+        if tap is None or self._watch_channel is None:
+            return
+        sl = tap.latest(4096)
+        if sl is None or len(sl) < 1024:
+            return
+        nfft = 1 << int(np.ceil(np.log2(max(1024, min(len(sl), 4096)))))
+        freqs, mag = usb_spectrum(sl, nfft=nfft)
+        band = (freqs >= VIEW_LO) & (freqs <= VIEW_HI)
+        self._watch_cq_channel(freqs[band], np.asarray(mag[band], dtype=np.float32))
+
+    def _watch_cq_channel(self, freqs: np.ndarray, mag: np.ndarray) -> None:
+        return
+
+    def _watch_other_traffic(self, decoded: tuple[str, str, str], fa: float, fb: float) -> None:
+        if (
+            not self.auto_active
+            or self.auto_qso is None
+            or self.auto_qso.state != "calling"
+            or self.auto_qso.target
+            or self.tx_session.busy
+            or self._watch_channel is None
+        ):
+            return
+        ch = self._channel_index(fa, fb)
+        if ch != self._watch_channel:
+            return
+        first, second, _field = (str(x).strip().upper() for x in decoded)
+        mine = self.auto_qso.my_call
+        if second == mine or first == mine or first == "CQ":
+            return
+        return
+
+    def _harvest_activity(self) -> None:
+        if not self.auto_active or self.auto_qso is None:
+            return
+        now = time.monotonic()
+        for r in range(self.band.rowCount()):
+            item = self.band.item(r, 0)
+            candidate = item.data(CAND_ROLE) if item is not None else None
+            if not isinstance(candidate, dict) or candidate.get("kind") != "cq":
+                continue
+            call = str(candidate.get("call") or "").strip().upper()
+            if not call or call == self.auto_qso.my_call:
+                continue
+            if self._is_worked(call) and not self._repeat_ok():
+                continue
+            if not self._answer_mode_ok(str(candidate.get("mode") or "")):
+                continue
+            ended = float(candidate.get("cq_end") or candidate.get("t") or 0.0)
+            stamped = float(candidate.get("t") or ended)
+            if now > max(ended, stamped) + max(CQ_GAP_S, 8.0):
+                continue
+            self._note_candidate(candidate)
+        if self._cq_pool:
+            self._flush_cq_pool()
 
     def _auto_hear(
         self,
@@ -1191,27 +1411,20 @@ class LyraWindow(QMainWindow):
                     "pick a CQ" if candidate["kind"] == "cq" else "pick a reply"
                 )
                 return
-            if pick == prefs.CQ_QUICKEST:
-                self._work_candidate(candidate)
-                return
-            if not self._cq_pick_timer.isActive():
-                self._cq_pick_timer.start(CQ_PICK_MS)
+            self._work_candidate(candidate)
+            if self.auto_qso is not None and self.auto_qso.target:
+                self._cq_repeat_timer.stop()
+                self._clear_channel_watch()
             return
-        delay_ms = 150
         previous_state = self.auto_qso.state
         action = self.auto_qso.hear(decoded, snr)
         if self.auto_qso.state == "complete":
             self._mark_worked(self.auto_qso.target)
         if action is not None:
             self.tx_status.setText("TX on")
-            controller = self.auto_qso
-            expected_state = controller.state
-            expected_target = controller.target
-            QTimer.singleShot(
-                delay_ms,
-                lambda: self._send_if_current(
-                    action, controller, expected_state, expected_target
-                ),
+            self._cq_repeat_timer.stop()
+            self._send_if_current(
+                action, self.auto_qso, self.auto_qso.state, self.auto_qso.target
             )
         elif self.auto_qso.state == "complete":
             target = self.auto_qso.target
@@ -1221,7 +1434,7 @@ class LyraWindow(QMainWindow):
             else:
                 generation = self._auto_generation
                 self.tx_status.setText("TX on")
-                QTimer.singleShot(2500, lambda: self._auto_continue(generation, True))
+                QTimer.singleShot(2500, lambda g=generation: self._auto_continue(g, True))
         elif previous_state != self.auto_qso.state and self.auto_qso.state == "listening":
             self.tx_status.setText("TX on")
 
@@ -1249,8 +1462,6 @@ class LyraWindow(QMainWindow):
             if not self._answer_mode_ok(mode):
                 return None
             ended = float(cq_end) if cq_end is not None else time.monotonic()
-            if time.monotonic() >= ended + CQ_GAP_S:
-                return None
             return {
                 "kind": "cq",
                 "call": second,
@@ -1267,16 +1478,15 @@ class LyraWindow(QMainWindow):
             and first == self.auto_qso.my_call
             and second
             and second != self.auto_qso.my_call
-            and len(field) == 4
-            and field[:2].isalpha()
-            and field[2:].isdigit()
+            and (_is_grid(field) or _is_rpt(field))
         ):
             if self._is_worked(second) and not self._repeat_ok():
                 return None
             return {
                 "kind": "reply",
                 "call": second,
-                "grid": field,
+                "grid": field if _is_grid(field) else "",
+                "roger": _is_rpt(field),
                 "snr": int(snr),
                 "fa": float(fa or 0.0),
                 "fb": float(fb or 0.0),
@@ -1329,51 +1539,39 @@ class LyraWindow(QMainWindow):
         call = str(candidate.get("call") or "").strip().upper()
         if call and self._is_worked(call) and not self._repeat_ok():
             return
-        delay_ms = 150
         if candidate.get("kind") == "cq" and candidate.get("fa") and candidate.get("fb"):
-            mid = 0.5 * (candidate["fa"] + candidate["fb"])
-            idx = min(
-                range(len(CHANNELS)),
-                key=lambda i: abs(mid - 0.5 * (CHANNELS[i][0] + CHANNELS[i][1])),
-            )
             mode = str(candidate.get("mode") or "F").upper()
             if mode not in ("F", "L"):
                 mode = "F"
-            plan = contention_plan(
-                candidate["call"],
-                self.auto_qso.my_call,
-                mode,
-                idx + 1,
-            )
             self.tx_mode.setCurrentText(mode)
-            self.tx_channel.setValue(plan.channel)
             self._cq_pool.clear()
             self._cq_pick_timer.stop()
+            now = time.monotonic()
+            cq_end = float(candidate.get("cq_end") or now)
+            jitter = random.uniform(0.0, ANSWER_JITTER_S)
             self._pending_answer = {
                 "candidate": candidate,
                 "fa": float(candidate["fa"]),
                 "fb": float(candidate["fb"]),
-                "jitter_s": plan.delay_ms / 1000.0,
-                "cq_end": float(candidate.get("cq_end") or time.monotonic()),
+                "jitter_s": jitter,
+                "cq_end": cq_end,
+                "tx_at": max(cq_end, now) + jitter,
             }
-            self.tx_status.setText("wait for gap")
+            self._try_pending_answer()
             return
-        action = self.auto_qso.begin_accept(candidate["call"], candidate["snr"])
+        action = self.auto_qso.begin_accept(
+            candidate["call"], candidate["snr"], roger=bool(candidate.get("roger"))
+        )
         if action is None:
             return
         self._bind_qso(candidate["call"])
         self._cq_pool.clear()
         self._cq_pick_timer.stop()
+        self._cq_repeat_timer.stop()
         self._pending_answer = None
         self.tx_status.setText("TX on")
-        controller = self.auto_qso
-        expected_state = controller.state
-        expected_target = controller.target
-        QTimer.singleShot(
-            delay_ms,
-            lambda: self._send_if_current(
-                action, controller, expected_state, expected_target
-            ),
+        self._send_if_current(
+            action, self.auto_qso, self.auto_qso.state, self.auto_qso.target
         )
 
     def _work_selected(self, *_args) -> None:
@@ -1442,6 +1640,9 @@ class LyraWindow(QMainWindow):
         return not self._answer_mode_ok(mode)
 
     def _poll_answer(self, freqs: np.ndarray, mag: np.ndarray) -> None:
+        self._try_pending_answer()
+
+    def _try_pending_answer(self) -> None:
         pending = self._pending_answer
         if pending is None:
             return
@@ -1455,18 +1656,9 @@ class LyraWindow(QMainWindow):
                 self._pending_answer = None
             return
         now = time.monotonic()
-        cq_end = float(pending.get("cq_end") or now)
-        if now >= cq_end + CQ_GAP_S:
-            self._pending_answer = None
-            self.tx_status.setText("TX on")
-            return
-        start_at = cq_end + ANSWER_CLEAR_S + float(pending.get("jitter_s") or 0.0)
-        if now < start_at:
-            self.tx_status.setText("wait for gap")
-            return
-        if start_at >= cq_end + CQ_GAP_S:
-            self._pending_answer = None
-            self.tx_status.setText("TX on")
+        tx_at = float(pending.get("tx_at") or pending.get("cq_end") or now)
+        if now < tx_at:
+            self.tx_status.setText("wait")
             return
         candidate = pending["candidate"]
         self._pending_answer = None
@@ -1707,6 +1899,13 @@ class LyraWindow(QMainWindow):
         if self.monitor.isChecked():
             self._start_rx()
 
+    def _startup_notice(self) -> None:
+        QMessageBox.information(
+            self,
+            "Lyra",
+            "Hey, this project is constantly being updated, please make sure to check for new updates regularly!",
+        )
+
     def _autostart(self) -> None:
         if self._started or self.worker.running:
             return
@@ -1718,7 +1917,41 @@ class LyraWindow(QMainWindow):
             self._start_rx()
 
     def _on_decode_toggle(self, on: bool) -> None:
-        self.worker.decode_enabled = bool(on)
+        if not self.tx_session.busy:
+            self.worker.decode_enabled = bool(on)
+
+    def _set_tx_light(self, on: bool) -> None:
+        color = "#3ddc84" if on else "#888888"
+        self.tx_light.setStyleSheet(
+            f"background:{color}; border-radius:5px; border:none;"
+        )
+
+    def _unmute_tx_channel(self) -> None:
+        if self.tx_session.busy:
+            return
+        self.worker.mute_channel = None
+
+    def _loopback(self, row: dict) -> bool:
+        if str(row.get("origin", "rx")) == "tx":
+            return False
+        if self.tx_session.busy:
+            return True
+        mine = self.my_call.text().strip().upper()
+        msg = str(row.get("msg") or "").strip().upper()
+        now = time.monotonic()
+        self._echo_msgs = [(t, m) for t, m in self._echo_msgs if now - t < 16.0]
+        if mine and (msg == f"CQ {mine}" or msg.startswith(f"CQ {mine} ")):
+            return True
+        if any(msg == m for _t, m in self._echo_msgs):
+            return True
+        decoded = row.get("decoded")
+        if isinstance(decoded, tuple) and len(decoded) == 3:
+            first, second, _field = str(decoded[0]).upper(), str(decoded[1]).upper(), decoded[2]
+            if mine and first == "CQ" and second == mine:
+                return True
+            if now < self._echo_until and mine and second == mine:
+                return True
+        return False
 
     def _on_monitor(self, on: bool) -> None:
         if on:
@@ -1753,10 +1986,7 @@ class LyraWindow(QMainWindow):
         if self.auto_active and self.auto_qso is not None and not self.tx_session.busy:
             state = self.auto_qso.expire()
             if state == "calling":
-                action = self.auto_qso.repeat_cq()
-                if action is not None:
-                    self.tx_status.setText("TX on")
-                    self._send_action(action)
+                self._schedule_cq_repeat(0.25)
             elif state == "listening":
                 self.tx_status.setText("TX on")
 
@@ -1831,6 +2061,8 @@ class LyraWindow(QMainWindow):
 
     def _on_n_channels(self, n: int) -> None:
         self._arm_auto()
+        self._overview_plan = None
+        self._sync_channel_overview(self._channel_grid())
 
     def _tick(self) -> None:
         self._drain_q()
@@ -1857,7 +2089,8 @@ class LyraWindow(QMainWindow):
         plan = list(LAST_PLAN) if LAST_PLAN else self._plan_pairs()
         if LAST_PLAN:
             self._follow_plan(list(LAST_PLAN))
-        self._sync_channel_overview(plan)
+        self._sync_channel_overview(self._channel_grid())
+        self._refresh_channel_busy(freqs, mag_i)
         if plan:
             fa0, fb0 = plan[0]
             self.rx_db.setText(f"{_snr_db(sl, fa0, fb0):+.0f} dB")
@@ -1886,6 +2119,12 @@ class LyraWindow(QMainWindow):
 
     def _on_decode(self, row: dict) -> None:
         origin = str(row.get("origin", "rx"))
+        if origin != "tx" and self._loopback(row):
+            return
+        if origin != "tx" and self.worker.mute_channel is not None:
+            ch = self._channel_index(float(row.get("fa") or 0.0), float(row.get("fb") or 0.0))
+            if ch == self.worker.mute_channel:
+                return
         if origin != "tx" and not self.decode_on.isChecked():
             return
         decoded = row.get("decoded")
@@ -1897,6 +2136,11 @@ class LyraWindow(QMainWindow):
                 float(row.get("fb") or 0.0),
                 str(row.get("mode") or ""),
                 float(row["cq_end"]) if row.get("cq_end") is not None else None,
+            )
+            self._watch_other_traffic(
+                decoded,
+                float(row.get("fa") or 0.0),
+                float(row.get("fb") or 0.0),
             )
         tone = "tx" if origin == "tx" else self._incoming_activity_tone(decoded)
         self._decode_count += 1
@@ -1931,6 +2175,7 @@ class LyraWindow(QMainWindow):
                     "fb": fb,
                     "mode": heard_mode,
                     "t": time.monotonic(),
+                    "cq_end": float(row["cq_end"]) if row.get("cq_end") is not None else time.monotonic(),
                 }
             elif (
                 second
@@ -1976,18 +2221,21 @@ class LyraWindow(QMainWindow):
                 plan.append(row_pair)
                 plan.sort(key=lambda pair: 0.5 * sum(pair))
             self._channel_counts[idx] = self._channel_counts.get(idx, 0) + 1
+            if origin != "tx":
+                self._channel_heard_at[idx] = time.monotonic()
             self._channel_tones[idx] = tone
             heard = str(row.get("mode") or "").upper()
             if heard in ("F", "L"):
                 self._channel_mode[idx] = heard
-            self._sync_channel_overview(plan or list(CHANNELS))
+            self._sync_channel_overview(self._channel_grid())
             r = self._channel_rows.get(idx)
             if r is not None:
                 self.rx_table.item(r, 1).setText(self._channel_mode.get(idx, ""))
                 self.rx_table.item(r, 3).setText(str(row.get("utc", "")))
                 self.rx_table.item(r, 4).setText(snr_text)
                 self.rx_table.item(r, 5).setText(str(self._channel_counts[idx]))
-                for c in range(self.rx_table.columnCount()):
+                self._set_channel_busy_cell(r, idx)
+                for c in range(6):
                     self._style_activity_item(self.rx_table.item(r, c), tone)
 
     def _incoming_activity_tone(self, decoded) -> str | None:
@@ -2020,6 +2268,37 @@ class LyraWindow(QMainWindow):
         item.setBackground(QColor(bg))
         item.setForeground(QColor(_contrast_fg(bg)))
 
+    def _channel_grid(self) -> list[tuple[float, float]]:
+        n = max(1, min(len(CHANNELS), int(self.n_ch.value())))
+        return list(CHANNELS[:n])
+
+    def _channel_marked_busy(self, idx: int, freqs=None, mag=None) -> bool:
+        if time.monotonic() - self._channel_heard_at.get(idx, 0.0) < BUSY_HOLD_S:
+            return True
+        if freqs is None or mag is None or idx < 0 or idx >= len(CHANNELS):
+            return False
+        fa, fb = CHANNELS[idx]
+        return self._channel_energy_busy(freqs, mag, fa, fb)
+
+    def _set_channel_busy_cell(self, row: int, idx: int, freqs=None, mag=None) -> None:
+        busy = self._channel_marked_busy(idx, freqs, mag)
+        item = self.rx_table.item(row, 6)
+        if item is None:
+            item = QTableWidgetItem()
+            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.rx_table.setItem(row, 6, item)
+        item.setText("busy" if busy else "ok")
+        if busy:
+            item.setBackground(QColor("#6a3a3a"))
+            item.setForeground(QColor("#f0d0d0"))
+        else:
+            item.setBackground(QColor("#2f4a38"))
+            item.setForeground(QColor("#d8f0dc"))
+
+    def _refresh_channel_busy(self, freqs, mag) -> None:
+        for idx, r in self._channel_rows.items():
+            self._set_channel_busy_cell(r, idx, freqs, mag)
+
     def _sync_channel_overview(self, plan: list[tuple[float, float]]) -> None:
         signature = tuple((round(a), round(b)) for a, b in plan)
         if signature == getattr(self, "_overview_plan", None):
@@ -2029,8 +2308,8 @@ class LyraWindow(QMainWindow):
         for idx, r in self._channel_rows.items():
             if r < self.rx_table.rowCount():
                 old[idx] = (
-                    self.rx_table.item(r, 3).text(),
-                    self.rx_table.item(r, 4).text(),
+                    self.rx_table.item(r, 3).text() if self.rx_table.item(r, 3) else "—",
+                    self.rx_table.item(r, 4).text() if self.rx_table.item(r, 4) else "—",
                 )
         self.rx_table.setRowCount(0)
         self._channel_rows.clear()
@@ -2050,6 +2329,7 @@ class LyraWindow(QMainWindow):
                 last,
                 snr,
                 str(self._channel_counts.get(idx, 0)),
+                "",
             )
             for c, text in enumerate(vals):
                 item = QTableWidgetItem(text)
@@ -2058,9 +2338,11 @@ class LyraWindow(QMainWindow):
                     tint = QColor(CH_COLORS[idx % len(CH_COLORS)])
                     tint.setAlpha(55)
                     item.setBackground(tint)
-                self._style_activity_item(item, self._channel_tones.get(idx))
+                if c < 6:
+                    self._style_activity_item(item, self._channel_tones.get(idx))
                 self.rx_table.setItem(r, c, item)
             self._channel_rows[idx] = r
+            self._set_channel_busy_cell(r, idx)
         self.rx_cap.setText(f"channels   {len(plan)}")
 
     def _clear_activity(self) -> None:
@@ -2069,13 +2351,12 @@ class LyraWindow(QMainWindow):
         self._channel_counts.clear()
         self._channel_tones.clear()
         self._channel_mode.clear()
+        self._channel_heard_at.clear()
         self.worker._seen_rows.clear()
         self._overview_plan = None
         self.band_cap.setText("activity   0")
         self._reset_qso_log()
-        from lyra.rx import LAST_PLAN
-
-        self._sync_channel_overview(list(LAST_PLAN))
+        self._sync_channel_overview(self._channel_grid())
 
     def _add_row(
         self,

@@ -63,7 +63,9 @@ BB_RATE = 400.0
 DECIM = int(round(SAMPLE_RATE / BB_RATE))  
 SPS = int(round(BB_RATE / BIT_RATE))  
 DEV_HZ = (MOD_INDEX / 2.0) * BIT_RATE
+LIVE_WINDOW_S = 5.2
 _COSTAS = np.array(COSTAS, dtype=np.int8)
+_POOL: ThreadPoolExecutor | None = None
 _LP = None
 _SMOOTH = None
 
@@ -71,6 +73,13 @@ STFT_N = 2048
 STFT_HOP = 1024
 _STFT_WIN = np.hanning(STFT_N)
 _STFT_F = np.fft.fftfreq(STFT_N, 1.0 / SAMPLE_RATE)
+
+
+def _pool() -> ThreadPoolExecutor:
+    global _POOL
+    if _POOL is None:
+        _POOL = ThreadPoolExecutor(max_workers=4)
+    return _POOL
 
 
 def _lp():
@@ -787,8 +796,8 @@ def _demod_slice(z: np.ndarray, mix_a: float, mix_b: float, i0: int, mode: str):
     n_mark = int(round(CHIRP_S * SAMPLE_RATE))
     data_n = int(round(_data_s(mode) * SAMPLE_RATE))
     d0 = i0 + n_mark
-    d1 = min(len(z), d0 + data_n)
-    if d1 - d0 < int(0.40 * SAMPLE_RATE):
+    d1 = d0 + data_n
+    if d0 < 0 or d1 > len(z):
         return 0, None
     ma = float(mix_a)
     mb = float(mix_b)
@@ -901,7 +910,7 @@ def _try_channel(
     return out
 
 
-def decode_many(audio: np.ndarray) -> list[dict]:
+def decode_many(audio: np.ndarray, *, live: bool = False) -> list[dict]:
     global LAST_STATUS, LAST_TONES, LAST_ROWS, _LAST_ROW, _LAST_CHIRP_AGE, _LAST_MIX
     global LAST_SHIFT, LAST_PLAN
     LAST_ROWS = []
@@ -910,7 +919,8 @@ def decode_many(audio: np.ndarray) -> list[dict]:
         LAST_STATUS = "short"
         return []
     x = x - np.mean(x)
-    x = x[-min(len(x), int(8.0 * SAMPLE_RATE)) :]
+    window_s = LIVE_WINDOW_S if live else 8.0
+    x = x[-min(len(x), int(window_s * SAMPLE_RATE)) :]
     mag = np.abs(x)
     scale = float(np.percentile(mag, 99.9)) + 1e-12
     x = np.clip(x / scale, -4.0, 4.0)
@@ -933,10 +943,13 @@ def decode_many(audio: np.ndarray) -> list[dict]:
         fa, fb = task
         return _try_channel(z80, fa, fb, now80)
 
-    with ThreadPoolExecutor(max_workers=min(4, len(plan))) as pool:
-        batches = pool.map(decode_task, tasks)
-        for batch in batches:
-            rows.extend(batch)
+    workers = min(4, len(plan))
+    if workers <= 1:
+        batches = [decode_task(task) for task in tasks]
+    else:
+        batches = list(_pool().map(decode_task, tasks))
+    for batch in batches:
+        rows.extend(batch)
     uniq: list[dict] = []
     seen: set[tuple] = set()
     for r in rows:
@@ -954,7 +967,7 @@ def decode_many(audio: np.ndarray) -> list[dict]:
         LAST_STATUS = f"Lyra  {len(uniq)} CRC  {tag}"
     else:
         cs = int(getattr(_try_channel, "last_costas", 0))
-        if _is_half_speed_iq(x):
+        if not live and _is_half_speed_iq(x):
             LAST_STATUS = "IQ IS 1/2 SPEED — reload PCM16 IQ file with Float32 Mode OFF"
         else:
             LAST_STATUS = f"{tag}  costas {cs}/8  no CRC"
