@@ -1,0 +1,18 @@
+Hamlib is bundled so Lyra can start rigctld without a separate Hamlib install.
+
+windows/
+  Hamlib 4.7.0 official win64 binaries
+  https://github.com/Hamlib/Hamlib/releases/download/4.7.0/hamlib-w64-4.7.0.zip
+
+macos-arm64/ and macos-x86_64/
+  Hamlib 4.7.2 plus libusb, relocated from Homebrew bottles
+  https://formulae.brew.sh/formula/hamlib
+
+linux-x86_64/ and linux-arm64/
+  Hamlib 4.5.4 plus libusb, libindiclient, and libnova from Debian
+  https://ftp.debian.org/debian/pool/main/h/hamlib/
+  Needs glibc 2.38 or newer (Ubuntu 24.04, Debian 13, and similar).
+  Also needs the usual system copies of libz, libudev, libstdc++, and libgcc.
+
+Hamlib is LGPL (see COPYING and COPYING.LIB.txt).
+Source: https://github.com/Hamlib/Hamlib

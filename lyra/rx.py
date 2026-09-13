@@ -21,7 +21,6 @@ from lyra.const import (
     TONE_A_HZ,
     TONE_B_HZ,
     CHANNELS,
-    CHANNEL_MODES,
 )
 from lyra.fec import decode_payload, deinterleave, deinterleave_metrics
 from lyra.pack import unpack_row
@@ -928,18 +927,11 @@ def decode_many(audio: np.ndarray) -> list[dict]:
     z80 = hilbert(x).astype(np.complex128)
     now80 = len(z80)
     rows: list[dict] = []
-    tasks = []
-    for fa, fb in plan:
-        mid = 0.5 * (fa + fb)
-        idx = min(
-            range(len(CHANNELS)),
-            key=lambda i: abs(mid - 0.5 * (CHANNELS[i][0] + CHANNELS[i][1])),
-        )
-        tasks.append((fa, fb, CHANNEL_MODES[idx]))
+    tasks = [(fa, fb) for fa, fb in plan]
 
     def decode_task(task):
-        fa, fb, mode = task
-        return _try_channel(z80, fa, fb, now80, expected_mode=mode)
+        fa, fb = task
+        return _try_channel(z80, fa, fb, now80)
 
     with ThreadPoolExecutor(max_workers=min(4, len(plan))) as pool:
         batches = pool.map(decode_task, tasks)

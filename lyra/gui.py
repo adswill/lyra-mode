@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime, timezone
@@ -14,13 +15,15 @@ from lyra.capture import AudioTap, default_input_index, list_inputs, load_soundd
 from lyra.codec import decode_usb_all, heartbeat_bits
 from lyra import codec as lyra_codec
 from lyra.qso_auto import AutoAction, AutoQso, contention_plan
+from lyra.hamlib import LocalRigctld, bundled_hamlib_dir, find_rigctld, list_models, list_serial_ports
 from lyra.rig import DummyRig, RigctldRig
 from lyra.tx import TxSession, build_tx_audio, list_outputs, write_tx_wav
+from lyra.bands import CUSTOM_LABEL, PRESETS, format_mhz, parse_frequency
 from lyra.const import (
     BIT_RATE,
-    CHANNEL_MODES,
+    CHIRP_S,
     CHANNELS,
-    RF_DIAL_HZ,
+    FRAME_BITS,
     SAMPLE_RATE,
     SPACING_HZ,
     TONE_A_HZ,
@@ -28,14 +31,16 @@ from lyra.const import (
 )
 from lyra.pack import pack_cq
 
-VIEW_LO = 400.0
-VIEW_HI = 5_500.0
+VIEW_LO = 300.0
+VIEW_HI = 2_800.0
 WF_NFFT = 8192
 WF_ROWS = 360
 WF_LEVELS = (-105.0, -55.0)
 LIVE_DECODE_INTERVAL_S = 0.15
 UI_RENDER_INTERVAL_S = 0.10
-CQ_LISTEN_MS = {"F": 4500, "L": 6500}
+CQ_PICK_MS = 1400
+CQ_GAP_S = 4.0
+ANSWER_CLEAR_S = 0.18
 CH_COLORS = ("#777777",) * 5
 from lyra.modem import usb_spectrum
 
@@ -55,13 +60,16 @@ def _ensure_gui_deps() -> None:
 _ensure_gui_deps()
 
 from PySide6.QtCore import Qt, QTimer, Signal, QObject
-from PySide6.QtGui import QAction, QColor, QPalette
+from PySide6.QtGui import QAction, QColor, QImage, QPainter, QPalette, QPen
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QColorDialog,
     QComboBox,
     QDialog,
+    QDialogButtonBox,
     QFileDialog,
+    QFormLayout,
     QFrame,
     QGroupBox,
     QHBoxLayout,
@@ -83,6 +91,31 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 import pyqtgraph as pg
+
+from lyra import geo
+from lyra import prefs
+
+CAND_ROLE = int(Qt.ItemDataRole.UserRole) + 1
+
+
+def _frame_s(mode: str) -> float:
+    data = FRAME_BITS / BIT_RATE if str(mode).upper() == "L" else (FRAME_BITS / 2.0) / BIT_RATE
+    return CHIRP_S + data
+
+
+def _cq_end_time(now: float, audio_n: int, i0: object, mode: str) -> float:
+    if i0 is None or audio_n <= 0:
+        return now
+    end_i = int(i0) + int(round(_frame_s(mode) * SAMPLE_RATE))
+    return now + (end_i - audio_n) / SAMPLE_RATE
+
+
+def _contrast_fg(bg: str) -> str:
+    c = QColor(bg)
+    if not c.isValid():
+        return "#ffffff"
+    lum = 0.299 * c.red() + 0.587 * c.green() + 0.114 * c.blue()
+    return "#111111" if lum >= 148 else "#ffffff"
 
 
 def _snr_db(audio: np.ndarray, fa: float | None = None, fb: float | None = None) -> float:
@@ -171,11 +204,14 @@ class DecodeWorker(QObject):
             got = rec["row"]
             fa = float(rec.get("fa") or 0.0)
             fb = float(rec.get("fb") or 0.0)
+            mode = str(rec.get("mode") or "")
             now = time.monotonic()
-            key = (got, round(fa), round(fb))
-            if now - self._seen_rows.get(key, -1e9) < 8.0:
+            cq_end = _cq_end_time(now, len(audio), rec.get("i0"), mode)
+            key = (got, round(fa), round(fb), mode)
+            prev_end = self._seen_rows.get(key, -1e9)
+            if abs(cq_end - prev_end) < 1.6:
                 continue
-            self._seen_rows[key] = now
+            self._seen_rows[key] = cq_end
             if len(self._seen_rows) > 512:
                 self._seen_rows = {
                     k: t for k, t in self._seen_rows.items() if now - t < 30.0
@@ -194,6 +230,8 @@ class DecodeWorker(QObject):
                         "fb": fb,
                         "msg": msg,
                         "decoded": got,
+                        "mode": mode,
+                        "cq_end": cq_end,
                     },
                 )
             )
@@ -249,7 +287,7 @@ class LyraWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("lyra")
-        self.resize(1400, 860)
+        self.resize(1520, 940)
         self.worker = DecodeWorker()
         self.tx_session = TxSession()
         self.tx_bridge = TxBridge()
@@ -258,7 +296,6 @@ class LyraWindow(QMainWindow):
         self._resume_monitor = False
         self._wf = None  
         self._started = False
-        self._last_lock = ""
         self._syncing = False
         self._ch_spec: list = []
         self._ch_wf: list = []
@@ -267,8 +304,16 @@ class LyraWindow(QMainWindow):
         self._channel_counts: dict[int, int] = {}
         self._channel_rows: dict[int, int] = {}
         self._channel_tones: dict[int, str | None] = {}
+        self._channel_mode: dict[int, str] = {}
         self._pending_tx_log: tuple[AutoAction, int] | None = None
         self._last_render = 0.0
+        self._cq_pool: dict[str, dict] = {}
+        self._worked: dict[str, float] = {}
+        self._pending_answer: dict | None = None
+        self._cq_pick_timer = QTimer(self)
+        self._cq_pick_timer.setSingleShot(True)
+        self._cq_pick_timer.timeout.connect(self._flush_cq_pool)
+        self._qso_call = ""
         self._build_menu()
         self._build()
         self._load_devices()
@@ -287,6 +332,10 @@ class LyraWindow(QMainWindow):
         act_open.setShortcut("Ctrl+O")
         act_open.triggered.connect(self._open_wav)
         file_m.addAction(act_open)
+        act_prefs = QAction("&Preferences…", self)
+        act_prefs.setShortcut("Ctrl+,")
+        act_prefs.triggered.connect(self._open_prefs)
+        file_m.addAction(act_prefs)
         act_quit = QAction("E&xit", self)
         act_quit.setShortcut("Ctrl+Q")
         act_quit.triggered.connect(self.close)
@@ -314,12 +363,69 @@ class LyraWindow(QMainWindow):
         QMessageBox.about(
             self,
             "About Lyra",
-            f"Lyra — chirp + dual-rail GMSK on {RF_DIAL_HZ / 1e6:.4f} USB\n"
+            f"Lyra — chirp + dual-rail GMSK on {format_mhz(self._dial_hz())} USB\n"
             "Lyra F (fast): slash high→low (right→left), unique bits per rail, ~2.3 s\n"
             "Lyra L (long): slash low→high (left→right), same bits both rails, ~4.3 s\n"
             f"{BIT_RATE:g} baud per rail, r=1/2 K=7 + CRC-16.\n\n"
-            "Channels is a maximum. Lyra places 80 Hz bands on the 500 Hz USB grid automatically.",
+            "Channels is a maximum. Lyra places 80 Hz bands on a 210 Hz USB grid inside a normal voice filter.",
         )
+
+    def _dial_hz(self) -> int:
+        return prefs.dial_hz()
+
+    def _fill_dial_combo(self, combo: QComboBox) -> None:
+        hz = self._dial_hz()
+        combo.blockSignals(True)
+        combo.clear()
+        for label, preset in PRESETS:
+            combo.addItem(label, preset)
+        combo.addItem(CUSTOM_LABEL, None)
+        idx = combo.findData(hz)
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+        else:
+            combo.setCurrentIndex(combo.findData(None))
+            combo.setEditText(format_mhz(hz))
+        combo.blockSignals(False)
+
+    def _hz_from_combo(self, combo: QComboBox) -> int | None:
+        text = combo.currentText().strip()
+        data = combo.currentData()
+        idx = combo.currentIndex()
+        if (
+            isinstance(data, int)
+            and data > 0
+            and idx >= 0
+            and text == combo.itemText(idx)
+        ):
+            return int(data)
+        return parse_frequency(text)
+
+    def _on_dial_chosen(self, _index: int = 0) -> None:
+        if self.dial.currentData() is None and self.dial.currentText().strip() in ("", CUSTOM_LABEL):
+            self.dial.setEditText(format_mhz(self._dial_hz()))
+            return
+        hz = self._hz_from_combo(self.dial)
+        if hz is None:
+            self._fill_dial_combo(self.dial)
+            return
+        self._apply_dial(hz)
+
+    def _on_dial_typed(self) -> None:
+        hz = parse_frequency(self.dial.currentText())
+        if hz is None:
+            self._fill_dial_combo(self.dial)
+            return
+        self._apply_dial(hz)
+
+    def _apply_dial(self, hz: int) -> None:
+        prefs.save_dial(hz)
+        self._fill_dial_combo(self.dial)
+        if getattr(self.rig, "connected", False):
+            try:
+                self.rig.set_frequency(hz)
+            except Exception as exc:
+                self.rig_status.setText(str(exc))
 
     def _build(self) -> None:
         pg.setConfigOptions(antialias=False, background="#000000", foreground="#777777")
@@ -352,8 +458,15 @@ class LyraWindow(QMainWindow):
         top.addWidget(self.n_ch)
 
         top.addWidget(self._vline())
-        dial = QLabel(f"{RF_DIAL_HZ / 1e3:.1f} kHz   USB")
-        top.addWidget(dial)
+        self.dial = QComboBox()
+        self.dial.setEditable(True)
+        self.dial.setMinimumWidth(168)
+        self.dial.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self._fill_dial_combo(self.dial)
+        self.dial.activated.connect(self._on_dial_chosen)
+        self.dial.lineEdit().editingFinished.connect(self._on_dial_typed)
+        top.addWidget(self.dial)
+        top.addWidget(QLabel("USB"))
         top.addStretch(1)
         top.addWidget(QLabel("audio"))
         self.dev = QComboBox()
@@ -379,8 +492,7 @@ class LyraWindow(QMainWindow):
         self.rx_db = QLabel("dB  —")
         self.rx_db.setFixedWidth(72)
         meters.addWidget(self.rx_db)
-        self.lock_lab = QLabel("no lock")
-        meters.addWidget(self.lock_lab, 1)
+        meters.addStretch(1)
         lay.addLayout(meters)
         lay.addWidget(self._build_tx_panel())
 
@@ -397,37 +509,71 @@ class LyraWindow(QMainWindow):
         traffic_head.addStretch(1)
         self.pause_feed = QCheckBox("Pause feed")
         traffic_head.addWidget(self.pause_feed)
+        self.answer_sel = QPushButton("work selected")
+        self.answer_sel.clicked.connect(self._work_selected)
+        traffic_head.addWidget(self.answer_sel)
         clear = QPushButton("clear")
         clear.setFixedWidth(64)
         clear.clicked.connect(self._clear_activity)
         traffic_head.addWidget(clear)
         left_l.addLayout(traffic_head)
-        self.band = QTableWidget(0, 4)
-        self.band.setHorizontalHeaderLabels(["time", "snr", "ch", "message"])
+        self.band = QTableWidget(0, 5)
+        self.band.setHorizontalHeaderLabels(["time", "snr", "ch", "dx", "message"])
         self.band.verticalHeader().setVisible(False)
         self.band.setShowGrid(False)
         self.band.setAlternatingRowColors(True)
         self.band.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.band.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.band.doubleClicked.connect(self._work_selected)
         hh = self.band.horizontalHeader()
         hh.setStretchLastSection(True)
         hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
         hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
         hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-        hh.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        hh.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         self.band.setColumnWidth(0, 72)
         self.band.setColumnWidth(1, 44)
         self.band.setColumnWidth(2, 110)
-        self.band.verticalHeader().setDefaultSectionSize(20)
+        self.band.setColumnWidth(3, 120)
+        self.band.verticalHeader().setDefaultSectionSize(24)
+        self.band.horizontalHeader().setMinimumHeight(26)
+        self._apply_dx_column()
         left_l.addWidget(self.band)
         lists.addWidget(left)
 
         right = QWidget()
         right_l = QVBoxLayout(right)
         right_l.setContentsMargins(0, 0, 0, 0)
-        right_l.setSpacing(2)
+        right_l.setSpacing(8)
+        self.qso_cap = QLabel("qso")
+        self.qso = QTableWidget(0, 4)
+        self.qso.setHorizontalHeaderLabels(["time", "snr", "ch", "message"])
+        self.qso.verticalHeader().setVisible(False)
+        self.qso.setShowGrid(False)
+        self.qso.setAlternatingRowColors(True)
+        self.qso.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.qso.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        qh = self.qso.horizontalHeader()
+        qh.setStretchLastSection(True)
+        qh.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        qh.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        qh.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        qh.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.qso.setColumnWidth(0, 78)
+        self.qso.setColumnWidth(1, 52)
+        self.qso.setColumnWidth(2, 110)
+        self.qso.verticalHeader().setDefaultSectionSize(24)
+        self.qso.horizontalHeader().setMinimumHeight(26)
+        qso_box = QWidget()
+        qso_l = QVBoxLayout(qso_box)
+        qso_l.setContentsMargins(0, 0, 0, 0)
+        qso_l.setSpacing(4)
+        qso_l.addWidget(self.qso_cap)
+        qso_l.addWidget(self.qso, 1)
+        qso_box.setMinimumHeight(180)
+
         self.rx_cap = QLabel("channels")
-        right_l.addWidget(self.rx_cap)
         self.rx_table = QTableWidget(0, 6)
         self.rx_table.setHorizontalHeaderLabels(["ch", "mode", "hz", "last", "snr", "count"])
         self.rx_table.verticalHeader().setVisible(False)
@@ -441,15 +587,29 @@ class LyraWindow(QMainWindow):
         rh.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
         rh.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
         rh.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
-        self.rx_table.setColumnWidth(0, 42)
-        self.rx_table.setColumnWidth(1, 48)
-        self.rx_table.setColumnWidth(2, 100)
-        self.rx_table.setColumnWidth(3, 70)
-        self.rx_table.setColumnWidth(4, 54)
-        self.rx_table.verticalHeader().setDefaultSectionSize(20)
-        right_l.addWidget(self.rx_table)
+        self.rx_table.setColumnWidth(0, 48)
+        self.rx_table.setColumnWidth(1, 56)
+        self.rx_table.setColumnWidth(2, 110)
+        self.rx_table.setColumnWidth(3, 78)
+        self.rx_table.setColumnWidth(4, 56)
+        self.rx_table.verticalHeader().setDefaultSectionSize(24)
+        self.rx_table.horizontalHeader().setMinimumHeight(26)
+        ch_box = QWidget()
+        ch_l = QVBoxLayout(ch_box)
+        ch_l.setContentsMargins(0, 0, 0, 0)
+        ch_l.setSpacing(4)
+        ch_l.addWidget(self.rx_cap)
+        ch_l.addWidget(self.rx_table, 1)
+        ch_box.setMinimumHeight(120)
+
+        right_split = QSplitter(Qt.Orientation.Vertical)
+        right_split.setChildrenCollapsible(False)
+        right_split.addWidget(qso_box)
+        right_split.addWidget(ch_box)
+        right_split.setSizes([280, 180])
+        right_l.addWidget(right_split, 1)
         lists.addWidget(right)
-        lists.setSizes([760, 320])
+        lists.setSizes([640, 560])
 
         split = QSplitter(Qt.Orientation.Vertical)
         split.setChildrenCollapsible(False)
@@ -461,7 +621,7 @@ class LyraWindow(QMainWindow):
         graph_l.setSpacing(0)
         gcap = QLabel("graph")
         graph_l.addWidget(gcap)
-        graph.setMinimumHeight(300)
+        graph.setMinimumHeight(220)
 
         self.plot = pg.PlotWidget()
         self.plot.setBackground("#000000")
@@ -470,7 +630,7 @@ class LyraWindow(QMainWindow):
         self.plot.setXRange(VIEW_LO, VIEW_HI, padding=0)
         self.plot.setYRange(-100, -10, padding=0)
         self.plot.disableAutoRange()
-        self.plot.getViewBox().setLimits(xMin=300, xMax=5500, yMin=-130, yMax=0)
+        self.plot.getViewBox().setLimits(xMin=200, xMax=2800, yMin=-130, yMax=0)
         self.plot.getAxis("bottom").setStyle(showValues=False)
         self.plot.setFixedHeight(130)
         self.curve = self.plot.plot(pen=pg.mkPen("#ffffff", width=1), clipToView=True)
@@ -485,7 +645,7 @@ class LyraWindow(QMainWindow):
         self.wf_plot.setYRange(0, WF_ROWS, padding=0)
         self.wf_plot.disableAutoRange()
         self.wf_plot.setXLink(self.plot)
-        self.wf_plot.setMinimumHeight(220)
+        self.wf_plot.setMinimumHeight(180)
         self.img = pg.ImageItem(axisOrder="row-major")
         self.wf_plot.addItem(self.img)
         self.img.setColorMap(_jt_colormap())
@@ -496,8 +656,9 @@ class LyraWindow(QMainWindow):
         graph_l.addWidget(self.wf_plot, 1)
         self._rebuild_channels(3)
         self._arm_auto()
+        self._apply_theme()
         split.addWidget(graph)
-        split.setSizes([280, 380])
+        split.setSizes([440, 300])
         lay.addWidget(split, 1)
 
         sb = QStatusBar()
@@ -514,17 +675,19 @@ class LyraWindow(QMainWindow):
         row.setSpacing(7)
 
         row.addWidget(QLabel("call"))
-        self.my_call = QLineEdit("K1ABC")
+        saved_call, saved_grid = prefs.station()
+        self.my_call = QLineEdit(saved_call)
         self.my_call.setFixedWidth(82)
+        self.my_call.editingFinished.connect(self._save_station)
         row.addWidget(self.my_call)
         row.addWidget(QLabel("grid"))
-        self.my_grid = QLineEdit("FN20")
+        self.my_grid = QLineEdit(saved_grid)
         self.my_grid.setFixedWidth(58)
+        self.my_grid.editingFinished.connect(self._save_station)
         row.addWidget(self.my_grid)
         row.addWidget(QLabel("mode"))
         self.tx_mode = QComboBox()
         self.tx_mode.addItems(["F", "L"])
-        self.tx_mode.currentIndexChanged.connect(self._on_tx_mode)
         row.addWidget(self.tx_mode)
         row.addWidget(QLabel("channel"))
         self.tx_channel = QSpinBox()
@@ -568,7 +731,8 @@ class LyraWindow(QMainWindow):
         
         self.rig_kind = QComboBox()
         self.rig_kind.addItem("Test", "dummy")
-        self.rig_kind.addItem("Hamlib rigctld", "rigctld")
+        self.rig_kind.addItem("Hamlib", "hamlib_local")
+        self.rig_kind.addItem("Hamlib network", "rigctld")
         self.rig_kind.currentIndexChanged.connect(self._on_rig_kind)
         self.rig_host = QLineEdit("127.0.0.1")
         self.rig_host.setFixedWidth(105)
@@ -576,10 +740,33 @@ class LyraWindow(QMainWindow):
         self.rig_port.setRange(1, 65535)
         self.rig_port.setValue(4532)
         self.rig_port.setFixedWidth(76)
+        self.rig_hamlib_path = QLineEdit()
+        bundled = bundled_hamlib_dir()
+        if bundled is not None:
+            self.rig_hamlib_path.setText(str(bundled))
+        self.rig_hamlib_path.setPlaceholderText("hamlib folder or rigctld")
+        self.rig_browse = QPushButton("browse")
+        self.rig_browse.clicked.connect(self._browse_hamlib)
+        self.rig_search = QLineEdit()
+        self.rig_search.setPlaceholderText("search name or id")
+        self.rig_search.textChanged.connect(self._filter_rig_models)
+        self.rig_model = QComboBox()
+        self.rig_model.setMinimumWidth(220)
+        self.rig_device = QComboBox()
+        self.rig_device.setEditable(True)
+        self.rig_device.setMinimumWidth(110)
+        self.rig_baud = QComboBox()
+        for rate in ("1200", "4800", "9600", "19200", "38400", "57600", "115200"):
+            self.rig_baud.addItem(rate)
+        self.rig_baud.setCurrentText("19200")
+        self.rig_pktusb = QCheckBox("packet USB")
+        self.rig_pktusb.setChecked(True)
         self.rig_connect = QPushButton("connect")
         self.rig_connect.clicked.connect(self._connect_rig)
         self.rig_status = QLabel("test ready")
         self.rig_status.setMinimumWidth(125)
+        self._hamlib = LocalRigctld()
+        self._rig_models: list[tuple[int, str]] = []
         self.tx_dev = QComboBox()
         self.tx_dev.setMinimumWidth(230)
         self._setup_dialog = None
@@ -623,24 +810,86 @@ class LyraWindow(QMainWindow):
             self.tx_status.setText(f"Audio output unavailable: {exc}")
 
     def _on_rig_kind(self, _index: int = 0) -> None:
-        network = self.rig_kind.currentData() == "rigctld"
+        kind = self.rig_kind.currentData()
+        local = kind == "hamlib_local"
+        network = kind == "rigctld"
+        self.rig_host.setVisible(network)
         self.rig_host.setEnabled(network)
-        self.rig_port.setEnabled(network)
-        self.rig_status.setText("not connected" if network else "test ready")
+        self.rig_port.setVisible(local or network)
+        self.rig_port.setEnabled(local or network)
+        for widget in (
+            self.rig_hamlib_path,
+            self.rig_browse,
+            self.rig_search,
+            self.rig_model,
+            self.rig_device,
+            self.rig_baud,
+        ):
+            widget.setVisible(local)
+        self.rig_pktusb.setVisible(local or network)
+        if local:
+            self._reload_serial_ports()
+            self._reload_hamlib_models()
+            self.rig_status.setText("not connected")
+        elif network:
+            self.rig_status.setText("not connected")
+        else:
+            self.rig_status.setText("test ready")
+
+    def _apply_radio_mode(self) -> None:
+        want = "PKTUSB" if self.rig_pktusb.isChecked() else "USB"
+        last = None
+        for mode, width in ((want, 3000), (want, 6000), ("USB", 3000), ("USB", 6000)):
+            try:
+                self.rig.set_mode(mode, width)
+                return
+            except Exception as exc:
+                last = exc
+        if last is not None:
+            raise last
 
     def _connect_rig(self) -> bool:
         try:
             self.rig.disconnect()
         except Exception:
             pass
+        kind = self.rig_kind.currentData()
         try:
-            if self.rig_kind.currentData() == "rigctld":
+            if kind == "hamlib_local":
+                exe = find_rigctld(self.rig_hamlib_path.text())
+                if not exe:
+                    raise RuntimeError("rigctld not found. Use the bundled hamlib folder, or browse to one.")
+                model = self.rig_model.currentData()
+                if model is None:
+                    typed = self.rig_search.text().strip()
+                    if typed.isdigit():
+                        model = int(typed)
+                if model is None:
+                    raise RuntimeError("Pick a radio from the list, or type its hamlib id.")
+                device = self.rig_device.currentText().strip()
+                if not device:
+                    raise RuntimeError("Set the COM port or serial device.")
+                conf = "ptt_type=RIG"
+                if self.rig_pktusb.isChecked():
+                    conf += ",dmode=PKTUSB,dmode_comp=1"
+                self._hamlib.start(
+                    exe=exe,
+                    model=int(model),
+                    device=device,
+                    baud=int(self.rig_baud.currentText()),
+                    port=self.rig_port.value(),
+                    conf=conf,
+                )
+                self.rig = RigctldRig("127.0.0.1", self.rig_port.value())
+            elif kind == "rigctld":
+                self._hamlib.stop()
                 self.rig = RigctldRig(self.rig_host.text().strip(), self.rig_port.value())
             else:
+                self._hamlib.stop()
                 self.rig = DummyRig()
             self.rig.connect()
-            self.rig.set_frequency(RF_DIAL_HZ)
-            self.rig.set_mode("USB", 6000)
+            self.rig.set_frequency(self._dial_hz())
+            self._apply_radio_mode()
         except Exception as exc:
             self.rig_status.setText("Connection failed")
             QMessageBox.warning(self, "Lyra rig control", str(exc))
@@ -648,13 +897,63 @@ class LyraWindow(QMainWindow):
         self.rig_status.setText(f"{self.rig.name} connected")
         return True
 
-    def _on_tx_mode(self, _index: int = 0) -> None:
-        mode = self.tx_mode.currentText()
-        ch = self.tx_channel.value()
-        if mode == "F" and ch > 5:
-            self.tx_channel.setValue(3)
-        elif mode == "L" and ch < 6:
-            self.tx_channel.setValue(6)
+    def _browse_hamlib(self) -> None:
+        path, _ok = QFileDialog.getExistingDirectory(self, "hamlib folder")
+        if not path:
+            return
+        self.rig_hamlib_path.setText(path)
+        self._reload_hamlib_models()
+
+    def _reload_serial_ports(self) -> None:
+        current = self.rig_device.currentText()
+        self.rig_device.blockSignals(True)
+        self.rig_device.clear()
+        ports = list_serial_ports()
+        if not ports:
+            ports = ["COM3"] if sys.platform == "win32" else ["/dev/ttyUSB0"]
+        for port in ports:
+            self.rig_device.addItem(port)
+        if current:
+            idx = self.rig_device.findText(current)
+            if idx >= 0:
+                self.rig_device.setCurrentIndex(idx)
+            else:
+                self.rig_device.setEditText(current)
+        self.rig_device.blockSignals(False)
+
+    def _reload_hamlib_models(self) -> None:
+        exe = find_rigctld(self.rig_hamlib_path.text())
+        if not exe:
+            self._rig_models = []
+            self._filter_rig_models()
+            return
+        try:
+            self._rig_models = list_models(exe)
+        except Exception as exc:
+            self._rig_models = []
+            self.rig_status.setText(str(exc))
+        self._filter_rig_models()
+
+    def _filter_rig_models(self, _text: str = "") -> None:
+        q = self.rig_search.text().strip().lower()
+        current = self.rig_model.currentData()
+        self.rig_model.blockSignals(True)
+        self.rig_model.clear()
+        for mid, label in self._rig_models:
+            if q and q not in label.lower() and q != str(mid):
+                continue
+            self.rig_model.addItem(label, mid)
+        if current is not None:
+            idx = self.rig_model.findData(current)
+            if idx >= 0:
+                self.rig_model.setCurrentIndex(idx)
+        if q.isdigit():
+            idx = self.rig_model.findData(int(q))
+            if idx >= 0:
+                self.rig_model.setCurrentIndex(idx)
+            elif self.rig_model.count() == 0:
+                self.rig_model.addItem(q, int(q))
+        self.rig_model.blockSignals(False)
 
     def _on_operation_changed(self, _index: int = 0) -> None:
         manual = self.tx_operation.currentData() == AutoQso.MANUAL_CQ
@@ -665,7 +964,7 @@ class LyraWindow(QMainWindow):
             dialog = QDialog(self)
             dialog.setWindowTitle("radio")
             dialog.setModal(False)
-            dialog.resize(560, 155)
+            dialog.resize(640, 250)
             lay = QVBoxLayout(dialog)
             rig_row = QHBoxLayout()
             rig_row.addWidget(QLabel("rig"))
@@ -674,6 +973,23 @@ class LyraWindow(QMainWindow):
             rig_row.addWidget(self.rig_port)
             rig_row.addWidget(self.rig_connect)
             lay.addLayout(rig_row)
+            ham_path = QHBoxLayout()
+            ham_path.addWidget(QLabel("hamlib"))
+            ham_path.addWidget(self.rig_hamlib_path, 1)
+            ham_path.addWidget(self.rig_browse)
+            lay.addLayout(ham_path)
+            ham_model = QHBoxLayout()
+            ham_model.addWidget(QLabel("radio"))
+            ham_model.addWidget(self.rig_search, 1)
+            ham_model.addWidget(self.rig_model, 2)
+            lay.addLayout(ham_model)
+            ham_port = QHBoxLayout()
+            ham_port.addWidget(QLabel("port"))
+            ham_port.addWidget(self.rig_device, 1)
+            ham_port.addWidget(QLabel("baud"))
+            ham_port.addWidget(self.rig_baud)
+            ham_port.addWidget(self.rig_pktusb)
+            lay.addLayout(ham_port)
             lay.addWidget(self.rig_status)
             audio_row = QHBoxLayout()
             audio_row.addWidget(QLabel("audio"))
@@ -715,7 +1031,7 @@ class LyraWindow(QMainWindow):
             return
         if not getattr(self.rig, "connected", False) and not self._connect_rig():
             return
-        if self.rig_kind.currentData() == "rigctld":
+        if self.rig_kind.currentData() in ("rigctld", "hamlib_local"):
             manual = controller.operation == AutoQso.MANUAL_CQ
             answer = QMessageBox.question(
                 self,
@@ -730,6 +1046,10 @@ class LyraWindow(QMainWindow):
                 return
         self.auto_qso = controller
         self.auto_active = True
+        self._reset_qso_log()
+        self._cq_pool.clear()
+        self._cq_pick_timer.stop()
+        self._pending_answer = None
         self._auto_generation = getattr(self, "_auto_generation", 0) + 1
         for control in (
             self.my_call,
@@ -746,15 +1066,19 @@ class LyraWindow(QMainWindow):
         if action is None:
             if not self.monitor.isChecked():
                 self.monitor.setChecked(True)
+            if prefs.cq_pick() == prefs.CQ_MANUAL:
+                self.tx_status.setText("pick a CQ")
         else:
             self._send_action(action)
+            if prefs.cq_pick() == prefs.CQ_MANUAL:
+                self.tx_status.setText("pick a reply")
 
     def _send_action(self, action: AutoAction) -> None:
         if not self.auto_active or self.tx_session.busy:
             return
         try:
-            self.rig.set_frequency(RF_DIAL_HZ)
-            self.rig.set_mode("USB", 6000)
+            self.rig.set_frequency(self._dial_hz())
+            self._apply_radio_mode()
             audio = self._make_tx_audio(action)
             self._resume_monitor = self.monitor.isChecked()
             if self._resume_monitor:
@@ -776,6 +1100,9 @@ class LyraWindow(QMainWindow):
         self.auto_active = False
         self.auto_qso = None
         self._pending_tx_log = None
+        self._cq_pool.clear()
+        self._cq_pick_timer.stop()
+        self._pending_answer = None
         self._auto_generation = getattr(self, "_auto_generation", 0) + 1
         self.tx_session.stop()
         self.tx_status.setText("TX off")
@@ -819,10 +1146,11 @@ class LyraWindow(QMainWindow):
         self.tx_status.setText("TX on")
         generation = self._auto_generation
         if self.auto_qso.state == "calling":
-            delay = CQ_LISTEN_MS[self.tx_mode.currentText()]
+            delay = int(CQ_GAP_S * 1000)
             QTimer.singleShot(delay, lambda: self._auto_continue(generation, False))
         elif self.auto_qso.state == "complete":
             QTimer.singleShot(2500, lambda: self._auto_continue(generation, True))
+            self._mark_worked(self.auto_qso.target)
 
     def _auto_continue(self, generation: int, completed: bool) -> None:
         if (
@@ -844,34 +1172,36 @@ class LyraWindow(QMainWindow):
         snr: int,
         fa: float = 0.0,
         fb: float = 0.0,
+        mode: str = "",
+        cq_end: float | None = None,
     ) -> None:
         if not self.auto_active or self.auto_qso is None or self.tx_session.busy:
             return
+        first, second, field = (str(x).strip().upper() for x in decoded)
+        candidate = self._candidate_from_decode(decoded, snr, fa, fb, mode, cq_end)
+        if candidate is None and self._ignore_repeat(decoded):
+            return
+        if candidate is None and self._reject_answer_mode(decoded, mode):
+            return
+        if candidate is not None:
+            self._note_candidate(candidate)
+            pick = prefs.cq_pick()
+            if pick == prefs.CQ_MANUAL:
+                self.tx_status.setText(
+                    "pick a CQ" if candidate["kind"] == "cq" else "pick a reply"
+                )
+                return
+            if pick == prefs.CQ_QUICKEST:
+                self._work_candidate(candidate)
+                return
+            if not self._cq_pick_timer.isActive():
+                self._cq_pick_timer.start(CQ_PICK_MS)
+            return
         delay_ms = 150
         previous_state = self.auto_qso.state
-        if (
-            self.auto_qso.operation == AutoQso.ANSWER_CQ
-            and self.auto_qso.state == "listening"
-            and decoded[0] == "CQ"
-            and fa
-            and fb
-        ):
-            mid = 0.5 * (fa + fb)
-            idx = min(
-                range(len(CHANNELS)),
-                key=lambda i: abs(mid - 0.5 * (CHANNELS[i][0] + CHANNELS[i][1])),
-            )
-            mode = CHANNEL_MODES[idx]
-            plan = contention_plan(
-                decoded[1],
-                self.auto_qso.my_call,
-                mode,
-                idx + 1,
-            )
-            self.tx_mode.setCurrentText(mode)
-            self.tx_channel.setValue(plan.channel)
-            delay_ms = plan.delay_ms
         action = self.auto_qso.hear(decoded, snr)
+        if self.auto_qso.state == "complete":
+            self._mark_worked(self.auto_qso.target)
         if action is not None:
             self.tx_status.setText("TX on")
             controller = self.auto_qso
@@ -885,6 +1215,7 @@ class LyraWindow(QMainWindow):
             )
         elif self.auto_qso.state == "complete":
             target = self.auto_qso.target
+            self._mark_worked(target)
             if self.auto_qso.operation == AutoQso.MANUAL_CQ:
                 self._finish_manual_qso(target)
             else:
@@ -893,6 +1224,427 @@ class LyraWindow(QMainWindow):
                 QTimer.singleShot(2500, lambda: self._auto_continue(generation, True))
         elif previous_state != self.auto_qso.state and self.auto_qso.state == "listening":
             self.tx_status.setText("TX on")
+
+    def _candidate_from_decode(
+        self,
+        decoded: tuple[str, str, str],
+        snr: int,
+        fa: float,
+        fb: float,
+        mode: str = "",
+        cq_end: float | None = None,
+    ) -> dict | None:
+        if self.auto_qso is None or self.auto_qso.target:
+            return None
+        first, second, field = (str(x).strip().upper() for x in decoded)
+        if (
+            self.auto_qso.operation == AutoQso.ANSWER_CQ
+            and self.auto_qso.state == "listening"
+            and first == "CQ"
+            and second
+            and second != self.auto_qso.my_call
+        ):
+            if self._is_worked(second) and not self._repeat_ok():
+                return None
+            if not self._answer_mode_ok(mode):
+                return None
+            ended = float(cq_end) if cq_end is not None else time.monotonic()
+            if time.monotonic() >= ended + CQ_GAP_S:
+                return None
+            return {
+                "kind": "cq",
+                "call": second,
+                "grid": field,
+                "snr": int(snr),
+                "fa": float(fa or 0.0),
+                "fb": float(fb or 0.0),
+                "mode": str(mode or "").upper(),
+                "t": time.monotonic(),
+                "cq_end": ended,
+            }
+        if (
+            self.auto_qso.state == "calling"
+            and first == self.auto_qso.my_call
+            and second
+            and second != self.auto_qso.my_call
+            and len(field) == 4
+            and field[:2].isalpha()
+            and field[2:].isdigit()
+        ):
+            if self._is_worked(second) and not self._repeat_ok():
+                return None
+            return {
+                "kind": "reply",
+                "call": second,
+                "grid": field,
+                "snr": int(snr),
+                "fa": float(fa or 0.0),
+                "fb": float(fb or 0.0),
+                "mode": str(mode or "").upper(),
+                "t": time.monotonic(),
+            }
+        return None
+
+    def _note_candidate(self, candidate: dict) -> None:
+        key = f"{candidate['kind']}:{candidate['call']}"
+        prev = self._cq_pool.get(key)
+        if prev is None or candidate["t"] >= prev["t"]:
+            self._cq_pool[key] = candidate
+
+    def _flush_cq_pool(self) -> None:
+        if not self.auto_active or self.auto_qso is None or self.auto_qso.target:
+            self._cq_pool.clear()
+            return
+        if not self._cq_pool:
+            return
+        pick = prefs.cq_pick()
+        my_grid = self.my_grid.text()
+        pool = [
+            item
+            for item in self._cq_pool.values()
+            if (self._repeat_ok() or not self._is_worked(item.get("call") or ""))
+            and self._answer_mode_ok(item.get("mode") or "")
+        ]
+        self._cq_pool.clear()
+        if not pool:
+            return
+
+        def score(item: dict) -> float:
+            dist = geo.distance_km(my_grid, item.get("grid") or "")
+            if pick == prefs.CQ_QUICKEST:
+                return -float(item["t"])
+            if pick == prefs.CQ_FARTHEST:
+                return float(dist) if dist is not None else -1.0
+            if pick == prefs.CQ_NEAREST:
+                return -float(dist) if dist is not None else -1e18
+            if pick == prefs.CQ_HIGHEST_SNR:
+                return float(item["snr"])
+            return -float(item["snr"])
+
+        self._work_candidate(max(pool, key=score))
+
+    def _work_candidate(self, candidate: dict) -> None:
+        if not self.auto_active or self.auto_qso is None or self.tx_session.busy:
+            return
+        call = str(candidate.get("call") or "").strip().upper()
+        if call and self._is_worked(call) and not self._repeat_ok():
+            return
+        delay_ms = 150
+        if candidate.get("kind") == "cq" and candidate.get("fa") and candidate.get("fb"):
+            mid = 0.5 * (candidate["fa"] + candidate["fb"])
+            idx = min(
+                range(len(CHANNELS)),
+                key=lambda i: abs(mid - 0.5 * (CHANNELS[i][0] + CHANNELS[i][1])),
+            )
+            mode = str(candidate.get("mode") or "F").upper()
+            if mode not in ("F", "L"):
+                mode = "F"
+            plan = contention_plan(
+                candidate["call"],
+                self.auto_qso.my_call,
+                mode,
+                idx + 1,
+            )
+            self.tx_mode.setCurrentText(mode)
+            self.tx_channel.setValue(plan.channel)
+            self._cq_pool.clear()
+            self._cq_pick_timer.stop()
+            self._pending_answer = {
+                "candidate": candidate,
+                "fa": float(candidate["fa"]),
+                "fb": float(candidate["fb"]),
+                "jitter_s": plan.delay_ms / 1000.0,
+                "cq_end": float(candidate.get("cq_end") or time.monotonic()),
+            }
+            self.tx_status.setText("wait for gap")
+            return
+        action = self.auto_qso.begin_accept(candidate["call"], candidate["snr"])
+        if action is None:
+            return
+        self._bind_qso(candidate["call"])
+        self._cq_pool.clear()
+        self._cq_pick_timer.stop()
+        self._pending_answer = None
+        self.tx_status.setText("TX on")
+        controller = self.auto_qso
+        expected_state = controller.state
+        expected_target = controller.target
+        QTimer.singleShot(
+            delay_ms,
+            lambda: self._send_if_current(
+                action, controller, expected_state, expected_target
+            ),
+        )
+
+    def _work_selected(self, *_args) -> None:
+        row = self.band.currentRow()
+        if row < 0:
+            return
+        item = self.band.item(row, 0)
+        candidate = item.data(CAND_ROLE) if item is not None else None
+        if not isinstance(candidate, dict):
+            return
+        if not self.auto_active or self.auto_qso is None:
+            QMessageBox.information(
+                self,
+                "Lyra",
+                "Start Auto, Answer, or Manual first, then select the station to work.",
+            )
+            return
+        self._work_candidate(candidate)
+
+    def _repeat_ok(self) -> bool:
+        return (
+            prefs.repeat_qso() == prefs.REPEAT_AGAIN
+            or prefs.cq_pick() == prefs.CQ_MANUAL
+        )
+
+    def _is_worked(self, call: str) -> bool:
+        return str(call or "").strip().upper() in self._worked
+
+    def _mark_worked(self, call: str) -> None:
+        call = str(call or "").strip().upper()
+        if call:
+            self._worked[call] = time.monotonic()
+
+    def _ignore_repeat(self, decoded: tuple[str, str, str]) -> bool:
+        if self.auto_qso is None or self.auto_qso.target or self._repeat_ok():
+            return False
+        first, second, field = (str(x).strip().upper() for x in decoded)
+        call = ""
+        if first == "CQ":
+            call = second
+        elif (
+            first == self.auto_qso.my_call
+            and len(field) == 4
+            and field[:2].isalpha()
+            and field[2:].isdigit()
+        ):
+            call = second
+        return bool(call) and self._is_worked(call)
+
+    def _answer_mode_ok(self, mode: str) -> bool:
+        if prefs.cq_pick() == prefs.CQ_MANUAL:
+            return True
+        want = prefs.answer_mode()
+        if want == prefs.ANSWER_BOTH:
+            return True
+        return str(mode or "").upper() == want
+
+    def _reject_answer_mode(self, decoded: tuple[str, str, str], mode: str) -> bool:
+        if self.auto_qso is None or self.auto_qso.operation != AutoQso.ANSWER_CQ:
+            return False
+        if self.auto_qso.target:
+            return False
+        first, second, _field = (str(x).strip().upper() for x in decoded)
+        if first != "CQ" or not second:
+            return False
+        return not self._answer_mode_ok(mode)
+
+    def _poll_answer(self, freqs: np.ndarray, mag: np.ndarray) -> None:
+        pending = self._pending_answer
+        if pending is None:
+            return
+        if (
+            not self.auto_active
+            or self.auto_qso is None
+            or self.tx_session.busy
+            or self.auto_qso.target
+        ):
+            if not self.auto_active or self.auto_qso is None or self.auto_qso.target:
+                self._pending_answer = None
+            return
+        now = time.monotonic()
+        cq_end = float(pending.get("cq_end") or now)
+        if now >= cq_end + CQ_GAP_S:
+            self._pending_answer = None
+            self.tx_status.setText("TX on")
+            return
+        start_at = cq_end + ANSWER_CLEAR_S + float(pending.get("jitter_s") or 0.0)
+        if now < start_at:
+            self.tx_status.setText("wait for gap")
+            return
+        if start_at >= cq_end + CQ_GAP_S:
+            self._pending_answer = None
+            self.tx_status.setText("TX on")
+            return
+        candidate = pending["candidate"]
+        self._pending_answer = None
+        action = self.auto_qso.begin_answer(candidate["call"], candidate["snr"])
+        if action is None:
+            return
+        self._bind_qso(candidate["call"])
+        self.tx_status.setText("TX on")
+        self._send_if_current(
+            action,
+            self.auto_qso,
+            self.auto_qso.state,
+            self.auto_qso.target,
+        )
+
+    def _open_prefs(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("preferences")
+        dialog.setModal(True)
+        dialog.resize(420, 380)
+        lay = QVBoxLayout(dialog)
+        form = QFormLayout()
+        cq = QComboBox()
+        for key, label in prefs.CQ_LABELS:
+            cq.addItem(label, key)
+        idx = cq.findData(prefs.cq_pick())
+        if idx >= 0:
+            cq.setCurrentIndex(idx)
+        form.addRow("priority", cq)
+        repeat = QComboBox()
+        for key, label in prefs.REPEAT_LABELS:
+            repeat.addItem(label, key)
+        idx = repeat.findData(prefs.repeat_qso())
+        if idx >= 0:
+            repeat.setCurrentIndex(idx)
+        form.addRow("already worked", repeat)
+        answer = QComboBox()
+        for key, label in prefs.ANSWER_LABELS:
+            answer.addItem(label, key)
+        idx = answer.findData(prefs.answer_mode())
+        if idx >= 0:
+            answer.setCurrentIndex(idx)
+        form.addRow("answer", answer)
+        dx = QComboBox()
+        for key, label in prefs.DX_LABELS:
+            dx.addItem(label, key)
+        idx = dx.findData(prefs.dx_show())
+        if idx >= 0:
+            dx.setCurrentIndex(idx)
+        form.addRow("show from grid", dx)
+        colors: dict[str, QPushButton] = {}
+        for key, label, default in prefs.COLOR_KEYS:
+            btn = QPushButton(prefs.color(key) or default)
+            btn.setFixedWidth(92)
+            self._paint_color_btn(btn)
+            btn.clicked.connect(lambda _=False, b=btn: self._pick_color(b))
+            form.addRow(label, btn)
+            colors[key] = btn
+        lay.addLayout(form)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        lay.addWidget(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        prefs.save_prefs(
+            cq=str(cq.currentData()),
+            dx=str(dx.currentData()),
+            repeat=str(repeat.currentData()),
+            answer=str(answer.currentData()),
+            colors={key: btn.text().strip() for key, btn in colors.items()},
+        )
+        self._apply_dx_column()
+        self._restyle_tables()
+
+    def _apply_dx_column(self) -> None:
+        hidden = prefs.dx_show() == prefs.DX_HIDDEN
+        self.band.setColumnHidden(3, hidden)
+
+    def _paint_color_btn(self, btn: QPushButton) -> None:
+        bg = btn.text().strip() or "#333333"
+        btn.setStyleSheet(
+            f"background: {bg}; color: {_contrast_fg(bg)}; border: 1px solid #3a3a3a;"
+        )
+
+    def _pick_color(self, btn: QPushButton) -> None:
+        chosen = QColorDialog.getColor(QColor(btn.text().strip() or "#333333"), self, "highlight")
+        if not chosen.isValid():
+            return
+        btn.setText(chosen.name())
+        self._paint_color_btn(btn)
+
+    def _restyle_tables(self) -> None:
+        for table in (self.band, self.qso, self.rx_table):
+            for r in range(table.rowCount()):
+                for c in range(table.columnCount()):
+                    item = table.item(r, c)
+                    if item is not None:
+                        self._style_activity_item(item, item.data(Qt.ItemDataRole.UserRole))
+
+    def _reset_qso_log(self) -> None:
+        self._qso_call = ""
+        self.qso.setRowCount(0)
+        self.qso_cap.setText("qso")
+
+    def _bind_qso(self, call: str) -> None:
+        call = str(call or "").strip().upper()
+        if not call:
+            return
+        mine = self.my_call.text().strip().upper()
+        if call != self._qso_call:
+            if self.qso.rowCount() == 0:
+                self._qso_call = call
+                self._backfill_qso(call)
+            else:
+                self._qso_call = call
+        self.qso_cap.setText(f"qso   {mine}  {call}" if mine else f"qso   {call}")
+
+    def _backfill_qso(self, call: str) -> None:
+        call = call.strip().upper()
+        for r in range(self.band.rowCount()):
+            msg_item = self.band.item(r, 4)
+            if msg_item is None:
+                continue
+            msg = msg_item.text().upper()
+            if call not in msg:
+                continue
+            vals = tuple(
+                (self.band.item(r, c).text() if self.band.item(r, c) else "")
+                for c in (0, 1, 2, 4)
+            )
+            tone = msg_item.data(Qt.ItemDataRole.UserRole)
+            self._add_row(self.qso, vals, keep=80, newest=False, tone=tone)
+        while self.qso.rowCount() > 40:
+            self.qso.removeRow(0)
+
+    def _log_qso_row(self, vals: tuple[str, ...], decoded, origin: str, tone: str | None) -> None:
+        if not self._is_qso_traffic(decoded, origin, vals[-1] if vals else ""):
+            return
+        qso_vals = (vals[0], vals[1], vals[2], vals[-1])
+        self._add_row(self.qso, qso_vals, keep=80, newest=True, tone=tone)
+        if self._qso_call:
+            mine = self.my_call.text().strip().upper()
+            self.qso_cap.setText(f"qso   {mine}  {self._qso_call}")
+
+    def _is_qso_traffic(self, decoded, origin: str, msg: str) -> bool:
+        mine = self.my_call.text().strip().upper()
+        target = ""
+        if self.auto_qso is not None and self.auto_qso.target:
+            target = self.auto_qso.target
+        elif self._qso_call:
+            target = self._qso_call
+        if origin == "tx" and (self.auto_active or target):
+            return True
+        parts: list[str] = []
+        if isinstance(decoded, tuple) and len(decoded) == 3:
+            parts = [str(x).strip().upper() for x in decoded]
+        else:
+            parts = msg.upper().split()
+        if not parts:
+            return False
+        if parts[0] == "CQ" and target and len(parts) > 1 and parts[1] == target:
+            return True
+        if target and mine:
+            return mine in parts and target in parts
+        return False
+
+    def _apply_theme(self) -> None:
+        app = QApplication.instance()
+        if app is not None:
+            apply_app_theme(app)
+        if getattr(self, "plot", None) is not None:
+            self.plot.setBackground("#000000")
+            self.curve.setPen(pg.mkPen("#ffffff", width=1))
+        if getattr(self, "wf_plot", None) is not None:
+            self.wf_plot.setBackground("#000000")
 
     def _send_if_current(
         self,
@@ -910,6 +1662,7 @@ class LyraWindow(QMainWindow):
             self._send_action(action)
 
     def _finish_manual_qso(self, target: str) -> None:
+        self._mark_worked(target)
         self.auto_active = False
         self.auto_qso = None
         self._auto_generation += 1
@@ -958,7 +1711,6 @@ class LyraWindow(QMainWindow):
         if self._started or self.worker.running:
             return
         if self.dev.currentData() is None:
-            self.lock_lab.setText("No input device")
             self.monitor.setChecked(False)
             return
         self._started = True
@@ -974,7 +1726,6 @@ class LyraWindow(QMainWindow):
                 self._start_rx()
         elif self.worker.running:
             self.worker.stop()
-            self.lock_lab.setText("Monitor off")
             self.vu.setValue(0)
             self.dev_lab.setText("Idle")
 
@@ -1100,6 +1851,7 @@ class LyraWindow(QMainWindow):
         freqs = freqs[band]
         mag_i = np.asarray(mag[band], dtype=np.float32)
         self.curve.setData(freqs, mag_i)
+        self._poll_answer(freqs, mag_i)
         from lyra.rx import LAST_PLAN
 
         plan = list(LAST_PLAN) if LAST_PLAN else self._plan_pairs()
@@ -1109,15 +1861,8 @@ class LyraWindow(QMainWindow):
         if plan:
             fa0, fb0 = plan[0]
             self.rx_db.setText(f"{_snr_db(sl, fa0, fb0):+.0f} dB")
-            pk = "  ".join(f"{a:.0f}+{b:.0f}" for a, b in plan)
         else:
             self.rx_db.setText("dB  —")
-            pk = "no channels"
-        extra = ""
-        if rms < 1.5e-4:
-            extra = "    silence on cable"
-        if tap.overruns:
-            extra += f"    audio drop {tap.overruns}"
         if self._wf is None or self._wf.shape[1] != len(mag_i):
             self._wf = np.repeat(mag_i[np.newaxis, :], WF_ROWS, axis=0)
         else:
@@ -1127,7 +1872,6 @@ class LyraWindow(QMainWindow):
         self.img.setRect(
             pg.QtCore.QRectF(VIEW_LO, 0.0, VIEW_HI - VIEW_LO, float(WF_ROWS))
         )
-        self.lock_lab.setText((self._last_lock or pk) + extra)
 
     def _drain_q(self) -> None:
         n = 0
@@ -1137,9 +1881,7 @@ class LyraWindow(QMainWindow):
             except Empty:
                 break
             n += 1
-            if kind == "status":
-                self._on_lock(str(payload))
-            elif kind == "row":
+            if kind == "row":
                 self._on_decode(payload)
 
     def _on_decode(self, row: dict) -> None:
@@ -1153,6 +1895,8 @@ class LyraWindow(QMainWindow):
                 int(row.get("db", -8)),
                 float(row.get("fa") or 0.0),
                 float(row.get("fb") or 0.0),
+                str(row.get("mode") or ""),
+                float(row["cq_end"]) if row.get("cq_end") is not None else None,
             )
         tone = "tx" if origin == "tx" else self._incoming_activity_tone(decoded)
         self._decode_count += 1
@@ -1163,14 +1907,60 @@ class LyraWindow(QMainWindow):
         elif row.get("fa"):
             hz = f"{row['fa']:.0f}"
         snr_text = str(row.get("snr_text") or f"{int(row.get('db', 0)):+d}")
+        dx = ""
+        candidate = None
+        if isinstance(decoded, tuple) and len(decoded) == 3:
+            first, second, field = (str(x).strip().upper() for x in decoded)
+            grid = ""
+            if first == "CQ" or (
+                len(field) == 4 and field[:2].isalpha() and field[2:].isdigit()
+            ):
+                grid = field
+            dx = geo.dx_text(grid, prefs.dx_show()) if grid else ""
+            snr_i = int(row.get("db", -8))
+            fa = float(row.get("fa") or 0.0)
+            fb = float(row.get("fb") or 0.0)
+            heard_mode = str(row.get("mode") or "").upper()
+            if first == "CQ" and second:
+                candidate = {
+                    "kind": "cq",
+                    "call": second,
+                    "grid": grid,
+                    "snr": snr_i,
+                    "fa": fa,
+                    "fb": fb,
+                    "mode": heard_mode,
+                    "t": time.monotonic(),
+                }
+            elif (
+                second
+                and first == self.my_call.text().strip().upper()
+                and len(field) == 4
+                and field[:2].isalpha()
+                and field[2:].isdigit()
+            ):
+                candidate = {
+                    "kind": "reply",
+                    "call": second,
+                    "grid": grid,
+                    "snr": snr_i,
+                    "fa": fa,
+                    "fb": fb,
+                    "mode": heard_mode,
+                    "t": time.monotonic(),
+                }
         vals = (
             str(row.get("utc", "")),
             snr_text,
             hz,
+            dx,
             str(row.get("msg", "")),
         )
         if not self.pause_feed.isChecked():
-            self._add_row(self.band, vals, keep=250, newest=True, tone=tone)
+            self._add_row(
+                self.band, vals, keep=250, newest=True, tone=tone, extra=candidate
+            )
+        self._log_qso_row(vals, decoded, origin, tone)
 
         from lyra.rx import LAST_PLAN
 
@@ -1187,9 +1977,13 @@ class LyraWindow(QMainWindow):
                 plan.sort(key=lambda pair: 0.5 * sum(pair))
             self._channel_counts[idx] = self._channel_counts.get(idx, 0) + 1
             self._channel_tones[idx] = tone
+            heard = str(row.get("mode") or "").upper()
+            if heard in ("F", "L"):
+                self._channel_mode[idx] = heard
             self._sync_channel_overview(plan or list(CHANNELS))
             r = self._channel_rows.get(idx)
             if r is not None:
+                self.rx_table.item(r, 1).setText(self._channel_mode.get(idx, ""))
                 self.rx_table.item(r, 3).setText(str(row.get("utc", "")))
                 self.rx_table.item(r, 4).setText(snr_text)
                 self.rx_table.item(r, 5).setText(str(self._channel_counts[idx]))
@@ -1197,34 +1991,34 @@ class LyraWindow(QMainWindow):
                     self._style_activity_item(self.rx_table.item(r, c), tone)
 
     def _incoming_activity_tone(self, decoded) -> str | None:
-        if (
-            not self.auto_active
-            or self.auto_qso is None
-            or not isinstance(decoded, tuple)
-            or len(decoded) != 3
-        ):
-            return None
+        if not isinstance(decoded, tuple) or len(decoded) != 3:
+            return "rx"
         first, second, _field = (str(x).upper() for x in decoded)
-        target = self.auto_qso.target
-        if first == "CQ":
-            if self.auto_qso.operation == AutoQso.ANSWER_CQ and target == second:
-                return "reply"
-            return None
-        if target and self.auto_qso.my_call in (first, second) and target in (first, second):
-            return "reply"
-        return None
+        mine = self.my_call.text().strip().upper()
+        target = ""
+        if self.auto_qso is not None:
+            target = self.auto_qso.target
+        if not target:
+            target = self._qso_call
+        if first == "CQ" and target and second == target:
+            return "qso"
+        if target and mine and mine in (first, second) and target in (first, second):
+            return "qso"
+        return "rx"
 
     @staticmethod
     def _style_activity_item(item: QTableWidgetItem | None, tone: str | None) -> None:
         if item is None:
             return
         item.setData(Qt.ItemDataRole.UserRole, tone)
-        if tone == "reply":
-            item.setBackground(QColor("#333333"))
-            item.setForeground(QColor("#ffffff"))
-        elif tone == "tx":
-            item.setBackground(QColor("#dddddd"))
-            item.setForeground(QColor("#000000"))
+        key = {"tx": "color_tx", "qso": "color_qso", "reply": "color_qso", "rx": "color_rx"}.get(
+            str(tone or "")
+        )
+        if not key:
+            return
+        bg = prefs.color(key)
+        item.setBackground(QColor(bg))
+        item.setForeground(QColor(_contrast_fg(bg)))
 
     def _sync_channel_overview(self, plan: list[tuple[float, float]]) -> None:
         signature = tuple((round(a), round(b)) for a, b in plan)
@@ -1251,7 +2045,7 @@ class LyraWindow(QMainWindow):
             last, snr = old.get(idx, ("—", "—"))
             vals = (
                 str(idx + 1),
-                CHANNEL_MODES[idx],
+                self._channel_mode.get(idx, ""),
                 f"{fa:.0f}+{fb:.0f}",
                 last,
                 snr,
@@ -1274,9 +2068,11 @@ class LyraWindow(QMainWindow):
         self._decode_count = 0
         self._channel_counts.clear()
         self._channel_tones.clear()
+        self._channel_mode.clear()
         self.worker._seen_rows.clear()
         self._overview_plan = None
         self.band_cap.setText("activity   0")
+        self._reset_qso_log()
         from lyra.rx import LAST_PLAN
 
         self._sync_channel_overview(list(LAST_PLAN))
@@ -1289,95 +2085,135 @@ class LyraWindow(QMainWindow):
         *,
         newest: bool = False,
         tone: str | None = None,
+        extra=None,
     ) -> None:
         r = 0 if newest else table.rowCount()
         table.insertRow(r)
         for c, text in enumerate(vals):
             item = QTableWidgetItem(text)
-            if c < 3:
+            if c < 4:
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            if extra is not None and c == 0:
+                item.setData(CAND_ROLE, extra)
             self._style_activity_item(item, tone)
             table.setItem(r, c, item)
         while table.rowCount() > keep:
             table.removeRow(table.rowCount() - 1 if newest else 0)
 
-    def _on_lock(self, text: str) -> None:
-        if "IQ IS " in text:
-            self._last_lock = text
-        elif " CRC" in text:
-            self._last_lock = text[: text.index(" CRC") + 4]
-        elif "costas" in text:
-            self._last_lock = text[text.index("costas") :]
-        else:
-            self._last_lock = text
+    def _save_station(self) -> None:
+        prefs.save_station(self.my_call.text(), self.my_grid.text())
 
     def closeEvent(self, event) -> None:
+        self._save_station()
         self.tx_session.stop()
         try:
             self.rig.disconnect()
+        except Exception:
+            pass
+        try:
+            self._hamlib.stop()
         except Exception:
             pass
         self.worker.stop()
         super().closeEvent(event)
 
 
+def _checkbox_x_url(color: str = "#ffffff") -> str:
+    size = 13
+    img = QImage(size, size, QImage.Format.Format_ARGB32)
+    img.fill(QColor(0, 0, 0, 0))
+    painter = QPainter(img)
+    pen = QPen(QColor(color))
+    pen.setWidth(2)
+    painter.setPen(pen)
+    painter.drawLine(2, 2, size - 3, size - 3)
+    painter.drawLine(size - 3, 2, 2, size - 3)
+    painter.end()
+    path = Path(tempfile.gettempdir()) / f"lyra_checkbox_x_{color.replace('#', '')}.png"
+    img.save(str(path))
+    return path.resolve().as_posix()
+
+
+_THEME = {
+    "dark": {
+        "bg": "#000000",
+        "fg": "#d0d0d0",
+        "muted": "#808080",
+        "border": "#3a3a3a",
+        "input": "#050505",
+        "hover": "#1a1a1a",
+        "alt": "#050505",
+        "disabled": "#555555",
+        "strong": "#ffffff",
+        "groove": "#242424",
+        "sel": "#3a3a3a",
+        "seltext": "#ffffff",
+        "x": "#ffffff",
+    },
+}
+
 _APP_QSS = """
 QMainWindow, QWidget#root {
-    background: #000000;
-    color: #d0d0d0;
+    background: @bg;
+    color: @fg;
     font-family: Menlo, Monaco, "Courier New", monospace;
     font-size: 12px;
 }
 QMenuBar {
-    background: #000000;
-    color: #d0d0d0;
-    border-bottom: 1px solid #3a3a3a;
+    background: @bg;
+    color: @fg;
+    border-bottom: 1px solid @border;
 }
-QMenuBar::item:selected, QMenu::item:selected { background: #3a3a3a; color: #ffffff; }
+QMenuBar::item:selected, QMenu::item:selected { background: @sel; color: @seltext; }
 QMenu {
-    background: #000000;
-    color: #d0d0d0;
-    border: 1px solid #3a3a3a;
+    background: @bg;
+    color: @fg;
+    border: 1px solid @border;
 }
 QComboBox, QPushButton, QSpinBox, QLineEdit {
-    background: #050505;
-    color: #d0d0d0;
-    border: 1px solid #3a3a3a;
+    background: @input;
+    color: @fg;
+    border: 1px solid @border;
     border-radius: 2px;
     padding: 3px 8px;
     min-height: 20px;
-    selection-background-color: #666666;
+    selection-background-color: @sel;
 }
 QPushButton:hover, QComboBox:hover, QSpinBox:hover, QLineEdit:hover {
-    background: #1a1a1a;
-    border-color: #ffffff;
+    background: @hover;
+    border-color: @strong;
 }
-QPushButton:pressed { background: #3a3a3a; }
+QPushButton:pressed { background: @sel; }
 QPushButton:disabled, QComboBox:disabled, QSpinBox:disabled, QLineEdit:disabled {
-    background: #000000;
-    color: #555555;
-    border-color: #242424;
+    background: @bg;
+    color: @disabled;
+    border-color: @groove;
 }
 QComboBox QAbstractItemView {
-    background: #050505;
-    color: #d0d0d0;
-    selection-background-color: #3a3a3a;
-    border: 1px solid #3a3a3a;
+    background: @input;
+    color: @fg;
+    selection-background-color: @sel;
+    border: 1px solid @border;
 }
-QCheckBox { spacing: 6px; color: #d0d0d0; }
-QCheckBox::indicator {
+QCheckBox, QRadioButton { spacing: 6px; color: @fg; }
+QCheckBox::indicator, QRadioButton::indicator {
     width: 13px;
     height: 13px;
-    background: #000000;
-    border: 1px solid #3a3a3a;
+    background: @bg;
+    border: 1px solid @border;
 }
-QCheckBox::indicator:checked {
-    background: #ffffff;
-    border-color: #ffffff;
+QCheckBox::indicator:checked, QRadioButton::indicator:checked {
+    background: @bg;
+    border-color: @strong;
+    image: url("__CHECK_X__");
+}
+QCheckBox::indicator:checked:hover, QRadioButton::indicator:checked:hover {
+    border-color: @strong;
+    image: url("__CHECK_X__");
 }
 QGroupBox {
-    color: #ffffff;
-    border: 1px solid #3a3a3a;
+    color: @strong;
+    border: 1px solid @border;
     margin-top: 8px;
     padding-top: 6px;
 }
@@ -1385,88 +2221,105 @@ QGroupBox::title {
     subcontrol-origin: margin;
     left: 8px;
     padding: 0 4px;
-    background: #000000;
+    background: @bg;
 }
-QLabel { color: #d0d0d0; }
+QLabel { color: @fg; }
 QHeaderView::section {
-    background: #050505;
-    color: #808080;
+    background: @input;
+    color: @muted;
     border: 0;
-    border-right: 1px solid #242424;
-    border-bottom: 1px solid #3a3a3a;
+    border-right: 1px solid @groove;
+    border-bottom: 1px solid @border;
     padding: 3px 6px;
 }
 QTableWidget {
-    background: #000000;
-    alternate-background-color: #050505;
-    color: #d0d0d0;
-    gridline-color: #242424;
-    selection-background-color: #3a3a3a;
-    selection-color: #ffffff;
-    border: 1px solid #3a3a3a;
+    background: @bg;
+    alternate-background-color: @alt;
+    color: @fg;
+    gridline-color: @groove;
+    selection-background-color: @sel;
+    selection-color: @seltext;
+    border: 1px solid @border;
 }
 QProgressBar {
-    background: #000000;
-    border: 1px solid #3a3a3a;
+    background: @bg;
+    border: 1px solid @border;
     text-align: center;
 }
-QProgressBar::chunk { background: #ffffff; }
+QProgressBar::chunk { background: @strong; }
 QStatusBar {
-    background: #000000;
-    color: #808080;
-    border-top: 1px solid #3a3a3a;
+    background: @bg;
+    color: @muted;
+    border-top: 1px solid @border;
 }
-QSplitter::handle { background: #3a3a3a; }
+QSplitter::handle { background: @border; }
 QToolTip {
-    background: #000000;
-    color: #d0d0d0;
-    border: 1px solid #ffffff;
+    background: @bg;
+    color: @fg;
+    border: 1px solid @strong;
 }
 QSlider::groove:horizontal {
     height: 4px;
-    background: #242424;
+    background: @groove;
 }
 QSlider::sub-page:horizontal {
-    background: #ffffff;
+    background: @strong;
 }
 QSlider::handle:horizontal {
     width: 14px;
     margin: -5px 0;
-    background: #ffffff;
-    border: 1px solid #ffffff;
+    background: @strong;
+    border: 1px solid @strong;
 }
 QScrollBar:vertical, QScrollBar:horizontal {
-    background: #000000;
+    background: @bg;
     width: 11px;
     height: 11px;
 }
 QScrollBar::handle:vertical, QScrollBar::handle:horizontal {
-    background: #3a3a3a;
+    background: @border;
     min-height: 24px;
     min-width: 24px;
 }
 QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
+QDialog {
+    background: @bg;
+    color: @fg;
+}
 """
+
+
+def app_stylesheet(theme: str | None = None) -> str:
+    palette = _THEME["dark"]
+    qss = _APP_QSS
+    for key, value in sorted(palette.items(), key=lambda kv: -len(kv[0])):
+        qss = qss.replace("@" + key, value)
+    return qss.replace("__CHECK_X__", _checkbox_x_url(palette["x"]))
+
+
+def apply_app_theme(app: QApplication, theme: str | None = None) -> None:
+    p = _THEME["dark"]
+    pal = QPalette()
+    pal.setColor(QPalette.ColorRole.Window, QColor(p["bg"]))
+    pal.setColor(QPalette.ColorRole.WindowText, QColor(p["fg"]))
+    pal.setColor(QPalette.ColorRole.Base, QColor(p["input"]))
+    pal.setColor(QPalette.ColorRole.AlternateBase, QColor(p["alt"]))
+    pal.setColor(QPalette.ColorRole.Text, QColor(p["fg"]))
+    pal.setColor(QPalette.ColorRole.Button, QColor(p["input"]))
+    pal.setColor(QPalette.ColorRole.ButtonText, QColor(p["fg"]))
+    pal.setColor(QPalette.ColorRole.Highlight, QColor(p["strong"]))
+    pal.setColor(QPalette.ColorRole.HighlightedText, QColor(p["bg"]))
+    pal.setColor(QPalette.ColorRole.PlaceholderText, QColor(p["muted"]))
+    pal.setColor(QPalette.ColorRole.ToolTipBase, QColor(p["bg"]))
+    pal.setColor(QPalette.ColorRole.ToolTipText, QColor(p["fg"]))
+    app.setPalette(pal)
+    app.setStyleSheet(app_stylesheet())
 
 
 def main() -> int:
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
-    pal = QPalette()
-    pal.setColor(QPalette.ColorRole.Window, QColor("#000000"))
-    pal.setColor(QPalette.ColorRole.WindowText, QColor("#d0d0d0"))
-    pal.setColor(QPalette.ColorRole.Base, QColor("#000000"))
-    pal.setColor(QPalette.ColorRole.AlternateBase, QColor("#050505"))
-    pal.setColor(QPalette.ColorRole.Text, QColor("#d0d0d0"))
-    pal.setColor(QPalette.ColorRole.Button, QColor("#050505"))
-    pal.setColor(QPalette.ColorRole.ButtonText, QColor("#d0d0d0"))
-    pal.setColor(QPalette.ColorRole.Highlight, QColor("#ffffff"))
-    pal.setColor(QPalette.ColorRole.HighlightedText, QColor("#000000"))
-    pal.setColor(QPalette.ColorRole.PlaceholderText, QColor("#666666"))
-    pal.setColor(QPalette.ColorRole.ToolTipBase, QColor("#000000"))
-    pal.setColor(QPalette.ColorRole.ToolTipText, QColor("#d0d0d0"))
-    app.setPalette(pal)
-    app.setStyleSheet(_APP_QSS)
+    apply_app_theme(app)
     win = LyraWindow()
     win.show()
     return app.exec()

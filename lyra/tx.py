@@ -11,7 +11,7 @@ from scipy.io import wavfile
 
 from lyra.capture import load_sounddevice
 from lyra.codec import frame_iq
-from lyra.const import CHANNEL_MODES, CHANNELS, PIN_HZ, SAMPLE_RATE
+from lyra.const import CHANNELS, PIN_HZ, SAMPLE_RATE
 
 
 def list_outputs(sd=None) -> list[tuple[int, str, int]]:
@@ -50,9 +50,6 @@ def build_tx_audio(
     if idx < 0 or idx >= len(CHANNELS):
         raise ValueError(f"channel must be 1–{len(CHANNELS)}")
     mode = mode.upper()
-    if CHANNEL_MODES[idx] != mode:
-        allowed = "1–5" if mode == "F" else "6–10"
-        raise ValueError(f"Lyra {mode} uses channels {allowed}")
     iq = frame_iq(info_bits, mode=mode)
     center = 0.5 * (CHANNELS[idx][0] + CHANNELS[idx][1])
     shift = center - PIN_HZ

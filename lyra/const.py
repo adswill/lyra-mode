@@ -5,11 +5,15 @@ TONE_B_HZ = 1_540.0
 PIN_HZ = 1_500.0
 
 
-CHANNEL_STEP_HZ = 500.0
+CHANNEL_STEP_HZ = 210.0
+CHANNEL_BASE_HZ = 380.0
 CHANNELS: tuple[tuple[float, float], ...] = tuple(
-    (460.0 + k * CHANNEL_STEP_HZ, 540.0 + k * CHANNEL_STEP_HZ) for k in range(10)
+    (
+        CHANNEL_BASE_HZ + k * CHANNEL_STEP_HZ,
+        CHANNEL_BASE_HZ + 80.0 + k * CHANNEL_STEP_HZ,
+    )
+    for k in range(10)
 )
-CHANNEL_MODES: tuple[str, ...] = ("F",) * 5 + ("L",) * 5
 PIN_GAIN = 0.0
 RF_DIAL_HZ = 14_106_400.0
 

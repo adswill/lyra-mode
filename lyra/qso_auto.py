@@ -28,8 +28,7 @@ def contention_plan(
     *,
     epoch_s: float | None = None,
 ) -> ReplyPlan:
-    first = 1 if mode.upper() == "F" else 6
-    allowed = list(range(first, first + 5))
+    allowed = list(range(1, 6))
     if int(cq_channel) in allowed:
         allowed.remove(int(cq_channel))
     bucket = int((time.time() if epoch_s is None else epoch_s) // 15)
@@ -57,6 +56,37 @@ class AutoQso:
         self.deadline = 0.0
         
         pack_cq(self.my_call, self.grid)
+
+    def begin_answer(self, call: str, snr: int, *, now: float | None = None) -> AutoAction | None:
+        if self.operation != self.ANSWER_CQ or self.state != "listening":
+            return None
+        target = str(call).strip().upper()
+        if not target or target == self.my_call:
+            return None
+        now = time.monotonic() if now is None else float(now)
+        self.target = target
+        self.remote_snr = max(-35, min(28, int(round(snr))))
+        self._wait("wait_report", now)
+        return AutoAction(
+            pack_reply(self.target, self.my_call, self.grid),
+            f"{self.target} {self.my_call} {self.grid}",
+        )
+
+    def begin_accept(self, call: str, snr: int, *, now: float | None = None) -> AutoAction | None:
+        if self.operation == self.ANSWER_CQ or self.state != "calling":
+            return None
+        target = str(call).strip().upper()
+        if not target or target == self.my_call:
+            return None
+        now = time.monotonic() if now is None else float(now)
+        report = max(-35, min(28, int(round(snr))))
+        self.target = target
+        self.remote_snr = report
+        self._wait("wait_r_report", now)
+        return AutoAction(
+            pack_rpt(self.target, self.my_call, report, False),
+            f"{self.target} {self.my_call} {report:+03d}",
+        )
 
     def start(self) -> AutoAction | None:
         self.target = ""
@@ -89,13 +119,7 @@ class AutoQso:
 
         if self.operation == self.ANSWER_CQ:
             if self.state == "listening" and first == "CQ" and second != self.my_call:
-                self.target = second
-                self.remote_snr = report
-                self._wait("wait_report", now)
-                return AutoAction(
-                    pack_reply(self.target, self.my_call, self.grid),
-                    f"{self.target} {self.my_call} {self.grid}",
-                )
+                return self.begin_answer(second, report, now=now)
             if self.state == "wait_report" and first == self.my_call and second == self.target:
                 if field.startswith(("+", "-")):
                     self._wait("wait_rr73", now)
@@ -123,12 +147,7 @@ class AutoQso:
 
         if self.state == "calling" and first == self.my_call and second != self.my_call:
             if len(field) == 4 and field[:2].isalpha() and field[2:].isdigit():
-                self.target = second
-                self._wait("wait_r_report", now)
-                return AutoAction(
-                    pack_rpt(self.target, self.my_call, report, False),
-                    f"{self.target} {self.my_call} {report:+03d}",
-                )
+                return self.begin_accept(second, report, now=now)
         if self.state == "wait_r_report" and first == self.my_call and second == self.target:
             if field.startswith("R+") or field.startswith("R-"):
                 self._wait("wait_73", now)

@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
+from lyra import geo
 from lyra import gui as lyra_gui
 from lyra.gui import (
     CHANNELS,
@@ -99,6 +100,10 @@ class LyraWindow(_LyraWindow):
         act_open.setShortcut("Ctrl+O")
         act_open.triggered.connect(self._open_wav)
         file_m.addAction(act_open)
+        act_prefs = QAction("&Preferences…", self)
+        act_prefs.setShortcut("Ctrl+,")
+        act_prefs.triggered.connect(self._open_prefs)
+        file_m.addAction(act_prefs)
         act_quit = QAction("E&xit", self)
         act_quit.setShortcut("Ctrl+Q")
         act_quit.triggered.connect(self.close)
@@ -172,15 +177,8 @@ class LyraWindow(_LyraWindow):
         if plan:
             fa0, fb0 = plan[0]
             self.rx_db.setText(f"{_snr_db(sl, fa0, fb0):+.0f} dB")
-            pk = "  ".join(f"{a:.0f}+{b:.0f}" for a, b in plan)
         else:
             self.rx_db.setText("dB  —")
-            pk = "no channels"
-        extra = ""
-        if rms < 1.5e-4:
-            extra = "    silence on cable"
-        if tap.overruns:
-            extra += f"    audio drop {tap.overruns}"
         if self._wf is None or self._wf.shape[1] != len(mag_i):
             self._wf = np.repeat(mag_i[np.newaxis, :], WF_ROWS, axis=0)
         else:
@@ -190,7 +188,6 @@ class LyraWindow(_LyraWindow):
         self.img.setRect(
             pg.QtCore.QRectF(VIEW_LO, 0.0, VIEW_HI - VIEW_LO, float(WF_ROWS))
         )
-        self.lock_lab.setText((self._last_lock or pk) + extra)
 
     def _on_decode(self, row: dict) -> None:
         origin = str(row.get("origin", "rx"))
@@ -213,14 +210,57 @@ class LyraWindow(_LyraWindow):
         elif row.get("fa"):
             hz = f"{row['fa']:.0f}"
         snr_text = str(row.get("snr_text") or f"{int(row.get('db', 0)):+d}")
+        dx = ""
+        candidate = None
+        if isinstance(decoded, tuple) and len(decoded) == 3:
+            first, second, field = (str(x).strip().upper() for x in decoded)
+            grid = ""
+            if first == "CQ" or (
+                len(field) == 4 and field[:2].isalpha() and field[2:].isdigit()
+            ):
+                grid = field
+            dx = geo.dx_text(grid, lyra_gui.prefs.dx_show()) if grid else ""
+            snr_i = int(row.get("db", -8))
+            fa = float(row.get("fa") or 0.0)
+            fb = float(row.get("fb") or 0.0)
+            if first == "CQ" and second:
+                candidate = {
+                    "kind": "cq",
+                    "call": second,
+                    "grid": grid,
+                    "snr": snr_i,
+                    "fa": fa,
+                    "fb": fb,
+                    "t": time.monotonic(),
+                }
+            elif (
+                second
+                and first == self.my_call.text().strip().upper()
+                and len(field) == 4
+                and field[:2].isalpha()
+                and field[2:].isdigit()
+            ):
+                candidate = {
+                    "kind": "reply",
+                    "call": second,
+                    "grid": grid,
+                    "snr": snr_i,
+                    "fa": fa,
+                    "fb": fb,
+                    "t": time.monotonic(),
+                }
         vals = (
             str(row.get("utc", "")),
             snr_text,
             hz,
+            dx,
             str(row.get("msg", "")),
         )
         if not self.pause_feed.isChecked():
-            self._add_row(self.band, vals, keep=250, newest=True, tone=tone)
+            self._add_row(
+                self.band, vals, keep=250, newest=True, tone=tone, extra=candidate
+            )
+        self._log_qso_row(vals, decoded, origin, tone)
         plan = list(lyra_codec.LAST_PLAN)
         if row.get("fa") and row.get("fb"):
             row_pair = (float(row["fa"]), float(row["fb"]))
@@ -251,27 +291,14 @@ class LyraWindow(_LyraWindow):
         self.worker._seen_rows.clear()
         self._overview_plan = None
         self.band_cap.setText("activity   0")
+        self._reset_qso_log()
         self._sync_channel_overview(list(lyra_codec.LAST_PLAN))
 
 
 def main() -> int:
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
-    pal = QPalette()
-    pal.setColor(QPalette.ColorRole.Window, QColor("#000000"))
-    pal.setColor(QPalette.ColorRole.WindowText, QColor("#d0d0d0"))
-    pal.setColor(QPalette.ColorRole.Base, QColor("#000000"))
-    pal.setColor(QPalette.ColorRole.AlternateBase, QColor("#050505"))
-    pal.setColor(QPalette.ColorRole.Text, QColor("#d0d0d0"))
-    pal.setColor(QPalette.ColorRole.Button, QColor("#050505"))
-    pal.setColor(QPalette.ColorRole.ButtonText, QColor("#d0d0d0"))
-    pal.setColor(QPalette.ColorRole.Highlight, QColor("#ffffff"))
-    pal.setColor(QPalette.ColorRole.HighlightedText, QColor("#000000"))
-    pal.setColor(QPalette.ColorRole.PlaceholderText, QColor("#666666"))
-    pal.setColor(QPalette.ColorRole.ToolTipBase, QColor("#000000"))
-    pal.setColor(QPalette.ColorRole.ToolTipText, QColor("#d0d0d0"))
-    app.setPalette(pal)
-    app.setStyleSheet(lyra_gui._APP_QSS)
+    lyra_gui.apply_app_theme(app)
     win = LyraWindow()
     win.show()
     return app.exec()
