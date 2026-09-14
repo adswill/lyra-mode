@@ -68,6 +68,7 @@ class AutoQso:
         self.remote_snr = -8
         self.state = "idle"
         self.deadline = 0.0
+        self._closing_sent = False
         
         pack_cq(self.my_call, self.grid)
 
@@ -119,6 +120,7 @@ class AutoQso:
     def start(self) -> AutoAction | None:
         self.target = ""
         self.deadline = 0.0
+        self._closing_sent = False
         if self.operation in (self.CALL_CQ, self.MANUAL_CQ):
             self.state = "calling"
             return AutoAction(pack_cq(self.my_call, self.grid), f"CQ {self.my_call} {self.grid}")
@@ -146,10 +148,11 @@ class AutoQso:
         report = max(-35, min(28, int(round(snr))))
 
         if self.operation == self.ANSWER_CQ:
-            if self.state == "listening" and first == "CQ" and second != self.my_call:
-                return self.begin_answer(second, report, now=now)
             if self.state == "wait_report" and first == self.my_call and second == self.target:
                 if _is_rpt(field) or field.startswith(("R+", "R-")):
+                    if self._closing_sent:
+                        return None
+                    self._closing_sent = True
                     self.state = "complete"
                     self.deadline = 0.0
                     return AutoAction(
@@ -163,6 +166,11 @@ class AutoQso:
                     self.deadline = 0.0
             if self.state == "wait_rr73" and first == self.my_call and second == self.target:
                 if field in ("RR73", "RRR"):
+                    if self._closing_sent:
+                        self.state = "complete"
+                        self.deadline = 0.0
+                        return None
+                    self._closing_sent = True
                     self.state = "complete"
                     self.deadline = 0.0
                     return AutoAction(
@@ -178,6 +186,8 @@ class AutoQso:
                 return self.begin_accept(second, report, now=now, roger=True)
         if self.state == "wait_r_report" and first == self.my_call and second == self.target:
             if field.startswith("R+") or field.startswith("R-"):
+                if self._closing_sent:
+                    return None
                 self._wait("wait_73", now)
                 return AutoAction(
                     pack_rr73(self.target, self.my_call),
@@ -185,6 +195,11 @@ class AutoQso:
                 )
         if self.state == "wait_73" and first == self.my_call and second == self.target:
             if field in ("RR73", "RRR"):
+                if self._closing_sent:
+                    self.state = "complete"
+                    self.deadline = 0.0
+                    return None
+                self._closing_sent = True
                 self.state = "complete"
                 self.deadline = 0.0
                 return AutoAction(
@@ -202,6 +217,7 @@ class AutoQso:
             return None
         self.target = ""
         self.deadline = 0.0
+        self._closing_sent = False
         self.state = (
             "calling"
             if self.operation in (self.CALL_CQ, self.MANUAL_CQ)

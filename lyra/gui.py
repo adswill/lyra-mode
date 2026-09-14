@@ -40,8 +40,10 @@ WF_LEVELS = (-105.0, -55.0)
 LIVE_DECODE_INTERVAL_S = 0.015
 LIVE_AUDIO_S = 5.2
 UI_RENDER_INTERVAL_S = 0.10
+WF_INTERVAL_S = 0.125
 CQ_PICK_MS = 5000
-CQ_GAP_S = 5.0
+CQ_GAP_S = 6.0
+CQ_SEEN_S = 5.4
 ANSWER_CLEAR_S = 0.0
 ANSWER_JITTER_S = 0.75
 BUSY_HOLD_S = 8.0
@@ -76,6 +78,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDockWidget,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -109,6 +112,12 @@ CAND_ROLE = int(Qt.ItemDataRole.UserRole) + 1
 def _frame_s(mode: str) -> float:
     data = FRAME_BITS / BIT_RATE if str(mode).upper() == "L" else (FRAME_BITS / 2.0) / BIT_RATE
     return CHIRP_S + data
+
+
+def _cq_start_time(now: float, audio_n: int, i0: object) -> float:
+    if i0 is None or audio_n <= 0:
+        return now
+    return now + (int(i0) - audio_n) / SAMPLE_RATE
 
 
 def _cq_end_time(now: float, audio_n: int, i0: object, mode: str) -> float:
@@ -225,12 +234,13 @@ class DecodeWorker(QObject):
                     continue
             mode = str(rec.get("mode") or "")
             now = time.monotonic()
-            cq_end = _cq_end_time(now, len(audio), rec.get("i0"), mode)
             key = (got, round(fa), round(fb), mode)
-            prev_end = self._seen_rows.get(key, -1e9)
-            if abs(cq_end - prev_end) < 1.6:
+            prev_t = self._seen_rows.get(key, -1e9)
+            if now - prev_t < CQ_SEEN_S:
                 continue
-            self._seen_rows[key] = cq_end
+            self._seen_rows[key] = now
+            cq_start = _cq_start_time(now, len(audio), rec.get("i0"))
+            cq_end = _cq_end_time(now, len(audio), rec.get("i0"), mode)
             if len(self._seen_rows) > 512:
                 self._seen_rows = {
                     k: t for k, t in self._seen_rows.items() if now - t < 30.0
@@ -247,6 +257,7 @@ class DecodeWorker(QObject):
                 "msg": msg,
                 "decoded": got,
                 "mode": mode,
+                "cq_start": cq_start,
                 "cq_end": cq_end,
             }
             self.decoded.emit(payload)
@@ -316,7 +327,6 @@ class LyraWindow(QMainWindow):
         self._echo_until = 0.0
         self._echo_msg = ""
         self._echo_msgs: list[tuple[float, str]] = []
-        self._resume_monitor = False
         self._started = False
         self._syncing = False
         self._ch_spec: list = []
@@ -330,9 +340,12 @@ class LyraWindow(QMainWindow):
         self._channel_heard_at: dict[int, float] = {}
         self._pending_tx_log: tuple[AutoAction, int] | None = None
         self._last_render = 0.0
+        self._last_wf = 0.0
         self._cq_pool: dict[str, dict] = {}
         self._worked: dict[str, float] = {}
         self._pending_answer: dict | None = None
+        self._answer_armed_at = 0.0
+        self._recent_rx: dict[tuple, float] = {}
         self._radio_hz: int | None = None
         self._radio_mode: str | None = None
         self._cq_pick_timer = QTimer(self)
@@ -465,16 +478,34 @@ class LyraWindow(QMainWindow):
             except Exception as exc:
                 self.rig_status.setText(str(exc))
 
+    def _make_dock(self, name: str, title: str, widget: QWidget) -> QDockWidget:
+        dock = QDockWidget(title, self)
+        dock.setObjectName(name)
+        dock.setWidget(widget)
+        dock.setAllowedAreas(Qt.DockWidgetArea.AllDockWidgetAreas)
+        dock.setFeatures(
+            QDockWidget.DockWidgetFeature.DockWidgetMovable
+            | QDockWidget.DockWidgetFeature.DockWidgetFloatable
+            | QDockWidget.DockWidgetFeature.DockWidgetClosable
+        )
+        return dock
+
     def _build(self) -> None:
         pg.setConfigOptions(antialias=False, background="#000000", foreground="#777777")
-        root = QWidget()
-        root.setObjectName("root")
-        self.setCentralWidget(root)
-        lay = QVBoxLayout(root)
-        lay.setContentsMargins(8, 6, 8, 4)
-        lay.setSpacing(6)
+        self.setDockNestingEnabled(True)
+        self.setDockOptions(
+            QMainWindow.DockOption.AnimatedDocks
+            | QMainWindow.DockOption.AllowNestedDocks
+            | QMainWindow.DockOption.AllowTabbedDocks
+        )
+        shell = QWidget()
+        shell.setObjectName("root")
+        shell.setMaximumSize(0, 0)
+        self.setCentralWidget(shell)
 
-        top = QHBoxLayout()
+        listen = QWidget()
+        top = QHBoxLayout(listen)
+        top.setContentsMargins(8, 6, 8, 6)
         top.setSpacing(8)
         self.monitor = QCheckBox("Monitor")
         self.monitor.setChecked(True)
@@ -508,7 +539,7 @@ class LyraWindow(QMainWindow):
         top.addStretch(1)
         top.addWidget(QLabel("audio"))
         self.dev = QComboBox()
-        self.dev.setMinimumWidth(280)
+        self.dev.setMinimumWidth(220)
         self.dev.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.dev.currentIndexChanged.connect(self._on_device)
         top.addWidget(self.dev, 1)
@@ -516,30 +547,21 @@ class LyraWindow(QMainWindow):
         ref.setFixedWidth(72)
         ref.clicked.connect(self._load_devices)
         top.addWidget(ref)
-        lay.addLayout(top)
-
-        meters = QHBoxLayout()
-        meters.setSpacing(8)
-        meters.addWidget(QLabel("rx"))
+        top.addWidget(self._vline())
+        top.addWidget(QLabel("rx"))
         self.vu = QProgressBar()
         self.vu.setRange(0, 100)
         self.vu.setTextVisible(False)
         self.vu.setFixedHeight(14)
         self.vu.setFixedWidth(140)
-        meters.addWidget(self.vu)
+        top.addWidget(self.vu)
         self.rx_db = QLabel("dB  —")
         self.rx_db.setFixedWidth(72)
-        meters.addWidget(self.rx_db)
-        meters.addStretch(1)
-        lay.addLayout(meters)
-        lay.addWidget(self._build_tx_panel())
-
-        lists = QSplitter(Qt.Orientation.Horizontal)
-        lists.setChildrenCollapsible(False)
+        top.addWidget(self.rx_db)
 
         left = QWidget()
         left_l = QVBoxLayout(left)
-        left_l.setContentsMargins(0, 0, 0, 0)
+        left_l.setContentsMargins(6, 4, 6, 4)
         left_l.setSpacing(2)
         traffic_head = QHBoxLayout()
         self.band_cap = QLabel("activity   0")
@@ -578,13 +600,13 @@ class LyraWindow(QMainWindow):
         self.band.horizontalHeader().setMinimumHeight(26)
         self._apply_dx_column()
         left_l.addWidget(self.band)
-        lists.addWidget(left)
 
-        right = QWidget()
-        right_l = QVBoxLayout(right)
-        right_l.setContentsMargins(0, 0, 0, 0)
-        right_l.setSpacing(8)
+        qso_box = QWidget()
+        qso_l = QVBoxLayout(qso_box)
+        qso_l.setContentsMargins(6, 4, 6, 4)
+        qso_l.setSpacing(4)
         self.qso_cap = QLabel("qso")
+        qso_l.addWidget(self.qso_cap)
         self.qso = QTableWidget(0, 4)
         self.qso.setHorizontalHeaderLabels(["time", "snr", "ch", "message"])
         self.qso.verticalHeader().setVisible(False)
@@ -603,15 +625,14 @@ class LyraWindow(QMainWindow):
         self.qso.setColumnWidth(2, 110)
         self.qso.verticalHeader().setDefaultSectionSize(24)
         self.qso.horizontalHeader().setMinimumHeight(26)
-        qso_box = QWidget()
-        qso_l = QVBoxLayout(qso_box)
-        qso_l.setContentsMargins(0, 0, 0, 0)
-        qso_l.setSpacing(4)
-        qso_l.addWidget(self.qso_cap)
         qso_l.addWidget(self.qso, 1)
-        qso_box.setMinimumHeight(180)
 
+        ch_box = QWidget()
+        ch_l = QVBoxLayout(ch_box)
+        ch_l.setContentsMargins(6, 4, 6, 4)
+        ch_l.setSpacing(4)
         self.rx_cap = QLabel("channels")
+        ch_l.addWidget(self.rx_cap)
         self.rx_table = QTableWidget(0, 7)
         self.rx_table.setHorizontalHeaderLabels(["ch", "mode", "hz", "last", "snr", "count", "busy"])
         self.rx_table.verticalHeader().setVisible(False)
@@ -634,33 +655,12 @@ class LyraWindow(QMainWindow):
         self.rx_table.setColumnWidth(5, 56)
         self.rx_table.verticalHeader().setDefaultSectionSize(24)
         self.rx_table.horizontalHeader().setMinimumHeight(26)
-        ch_box = QWidget()
-        ch_l = QVBoxLayout(ch_box)
-        ch_l.setContentsMargins(0, 0, 0, 0)
-        ch_l.setSpacing(4)
-        ch_l.addWidget(self.rx_cap)
         ch_l.addWidget(self.rx_table, 1)
-        ch_box.setMinimumHeight(120)
-
-        right_split = QSplitter(Qt.Orientation.Vertical)
-        right_split.setChildrenCollapsible(False)
-        right_split.addWidget(qso_box)
-        right_split.addWidget(ch_box)
-        right_split.setSizes([280, 180])
-        right_l.addWidget(right_split, 1)
-        lists.addWidget(right)
-        lists.setSizes([640, 560])
-
-        split = QSplitter(Qt.Orientation.Vertical)
-        split.setChildrenCollapsible(False)
-        split.addWidget(lists)
 
         graph = QWidget()
         graph_l = QVBoxLayout(graph)
         graph_l.setContentsMargins(0, 0, 0, 0)
         graph_l.setSpacing(0)
-        gcap = QLabel("graph")
-        graph_l.addWidget(gcap)
         graph.setMinimumHeight(220)
 
         self.plot = pg.PlotWidget()
@@ -697,9 +697,41 @@ class LyraWindow(QMainWindow):
         self._rebuild_channels(3)
         self._arm_auto()
         self._apply_theme()
-        split.addWidget(graph)
-        split.setSizes([440, 300])
-        lay.addWidget(split, 1)
+
+        listen_dock = self._make_dock("dock_listen", "listen", listen)
+        tx_dock = self._make_dock("dock_tx", "tx", self._build_tx_panel())
+        act_dock = self._make_dock("dock_activity", "activity", left)
+        qso_dock = self._make_dock("dock_qso", "qso", qso_box)
+        ch_dock = self._make_dock("dock_channels", "channels", ch_box)
+        graph_dock = self._make_dock("dock_graph", "graph", graph)
+        graph_dock.setFeatures(
+            QDockWidget.DockWidgetFeature.DockWidgetMovable
+            | QDockWidget.DockWidgetFeature.DockWidgetFloatable
+        )
+        self._docks = (listen_dock, tx_dock, act_dock, qso_dock, ch_dock, graph_dock)
+
+        self.addDockWidget(Qt.DockWidgetArea.TopDockWidgetArea, listen_dock)
+        self.splitDockWidget(listen_dock, tx_dock, Qt.Orientation.Vertical)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, graph_dock)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, act_dock)
+        self.splitDockWidget(graph_dock, act_dock, Qt.Orientation.Vertical)
+        self.splitDockWidget(act_dock, qso_dock, Qt.Orientation.Horizontal)
+        self.splitDockWidget(qso_dock, ch_dock, Qt.Orientation.Vertical)
+
+        view_m = self.menuBar().addMenu("&View")
+        for dock in self._docks:
+            view_m.addAction(dock.toggleViewAction())
+        reset_lay = QAction("Reset layout", self)
+        reset_lay.triggered.connect(self._reset_layout)
+        view_m.addSeparator()
+        view_m.addAction(reset_lay)
+
+        geo = prefs.settings().value("win_geo")
+        st = prefs.settings().value("win_docks")
+        if geo is not None:
+            self.restoreGeometry(geo)
+        if st is not None:
+            self.restoreState(st)
 
         sb = QStatusBar()
         self.setStatusBar(sb)
@@ -708,8 +740,26 @@ class LyraWindow(QMainWindow):
         sb.addWidget(self.utc_lab)
         sb.addWidget(self.dev_lab, 1)
 
-    def _build_tx_panel(self) -> QGroupBox:
-        box = QGroupBox("tx")
+    def _reset_layout(self) -> None:
+        prefs.settings().remove("win_docks")
+        prefs.settings().remove("win_geo")
+        prefs.settings().sync()
+        listen, tx, act, qso, ch, graph = self._docks
+        for dock in self._docks:
+            dock.setFloating(False)
+            dock.show()
+            self.removeDockWidget(dock)
+            self.addDockWidget(Qt.DockWidgetArea.TopDockWidgetArea, dock)
+            dock.show()
+        self.addDockWidget(Qt.DockWidgetArea.TopDockWidgetArea, listen)
+        self.splitDockWidget(listen, tx, Qt.Orientation.Vertical)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, graph)
+        self.splitDockWidget(graph, act, Qt.Orientation.Vertical)
+        self.splitDockWidget(act, qso, Qt.Orientation.Horizontal)
+        self.splitDockWidget(qso, ch, Qt.Orientation.Vertical)
+
+    def _build_tx_panel(self) -> QWidget:
+        box = QWidget()
         row = QHBoxLayout(box)
         row.setContentsMargins(8, 6, 8, 7)
         row.setSpacing(7)
@@ -734,6 +784,7 @@ class LyraWindow(QMainWindow):
         self.tx_channel.setRange(1, 10)
         self.tx_channel.setValue(3)
         self.tx_channel.setFixedWidth(52)
+        self.tx_channel.valueChanged.connect(self._paint_channel_regions)
         row.addWidget(self.tx_channel)
         row.addWidget(QLabel("option"))
         self.tx_operation = QComboBox()
@@ -1014,6 +1065,11 @@ class LyraWindow(QMainWindow):
     def _on_operation_changed(self, _index: int = 0) -> None:
         manual = self.tx_operation.currentData() == AutoQso.MANUAL_CQ
         self.tx_button.setText("start one qso" if manual else "start")
+        self._sync_tx_channel_enabled()
+
+    def _sync_tx_channel_enabled(self) -> None:
+        answering = self.tx_operation.currentData() == AutoQso.ANSWER_CQ
+        self.tx_channel.setEnabled(not answering and not self.auto_active)
 
     def _open_tx_setup(self) -> None:
         if self._setup_dialog is None:
@@ -1107,6 +1163,9 @@ class LyraWindow(QMainWindow):
         self._cq_pick_timer.stop()
         self._cq_repeat_timer.stop()
         self._pending_answer = None
+        self._answer_armed_at = (
+            time.monotonic() if controller.operation == AutoQso.ANSWER_CQ else 0.0
+        )
         self._clear_channel_watch()
         self._auto_generation = getattr(self, "_auto_generation", 0) + 1
         for control in (
@@ -1127,7 +1186,7 @@ class LyraWindow(QMainWindow):
             if prefs.cq_pick() == prefs.CQ_MANUAL:
                 self.tx_status.setText("pick a CQ")
             else:
-                self._harvest_activity()
+                self.tx_status.setText("wait CQ")
         else:
             self._send_action(action)
             if prefs.cq_pick() == prefs.CQ_MANUAL:
@@ -1144,9 +1203,6 @@ class LyraWindow(QMainWindow):
             self._echo_msgs.append((time.monotonic(), self._echo_msg))
             self._pending_tx_log = (action, self.tx_channel.value())
             self.worker.mute_channel = int(self.tx_channel.value())
-            self._resume_monitor = self.monitor.isChecked()
-            if self._resume_monitor:
-                self.monitor.setChecked(False)
             self.tx_status.setText("TX on")
             self._set_tx_light(True)
             self.tx_session.start(
@@ -1167,14 +1223,12 @@ class LyraWindow(QMainWindow):
         self._cq_pick_timer.stop()
         self._cq_repeat_timer.stop()
         self._pending_answer = None
+        self._answer_armed_at = 0.0
         self._clear_channel_watch()
         self._auto_generation = getattr(self, "_auto_generation", 0) + 1
         self.tx_session.stop()
         self.worker.decode_enabled = self.decode_on.isChecked()
         self._unmute_tx_channel()
-        if self._resume_monitor:
-            self._resume_monitor = False
-            self.monitor.setChecked(True)
         self._set_tx_light(False)
         self.tx_status.setText("TX off")
         self.tx_button.setEnabled(True)
@@ -1187,6 +1241,7 @@ class LyraWindow(QMainWindow):
             self.tx_operation,
         ):
             control.setEnabled(True)
+        self._sync_tx_channel_enabled()
 
     def _on_tx_status(self, message: str, done: bool) -> None:
         if not done:
@@ -1197,9 +1252,6 @@ class LyraWindow(QMainWindow):
             return
         self.worker.decode_enabled = self.decode_on.isChecked()
         self._set_tx_light(False)
-        if self._resume_monitor:
-            self._resume_monitor = False
-            self.monitor.setChecked(True)
         self._echo_until = time.monotonic() + ECHO_S
         if self.worker.tap is not None:
             self.worker.tap.clear()
@@ -1362,30 +1414,6 @@ class LyraWindow(QMainWindow):
             return
         return
 
-    def _harvest_activity(self) -> None:
-        if not self.auto_active or self.auto_qso is None:
-            return
-        now = time.monotonic()
-        for r in range(self.band.rowCount()):
-            item = self.band.item(r, 0)
-            candidate = item.data(CAND_ROLE) if item is not None else None
-            if not isinstance(candidate, dict) or candidate.get("kind") != "cq":
-                continue
-            call = str(candidate.get("call") or "").strip().upper()
-            if not call or call == self.auto_qso.my_call:
-                continue
-            if self._is_worked(call) and not self._repeat_ok():
-                continue
-            if not self._answer_mode_ok(str(candidate.get("mode") or "")):
-                continue
-            ended = float(candidate.get("cq_end") or candidate.get("t") or 0.0)
-            stamped = float(candidate.get("t") or ended)
-            if now > max(ended, stamped) + max(CQ_GAP_S, 8.0):
-                continue
-            self._note_candidate(candidate)
-        if self._cq_pool:
-            self._flush_cq_pool()
-
     def _auto_hear(
         self,
         decoded: tuple[str, str, str],
@@ -1394,11 +1422,14 @@ class LyraWindow(QMainWindow):
         fb: float = 0.0,
         mode: str = "",
         cq_end: float | None = None,
+        cq_start: float | None = None,
     ) -> None:
         if not self.auto_active or self.auto_qso is None or self.tx_session.busy:
             return
         first, second, field = (str(x).strip().upper() for x in decoded)
-        candidate = self._candidate_from_decode(decoded, snr, fa, fb, mode, cq_end)
+        candidate = self._candidate_from_decode(
+            decoded, snr, fa, fb, mode, cq_end, cq_start
+        )
         if candidate is None and self._ignore_repeat(decoded):
             return
         if candidate is None and self._reject_answer_mode(decoded, mode):
@@ -1446,6 +1477,7 @@ class LyraWindow(QMainWindow):
         fb: float,
         mode: str = "",
         cq_end: float | None = None,
+        cq_start: float | None = None,
     ) -> dict | None:
         if self.auto_qso is None or self.auto_qso.target:
             return None
@@ -1462,6 +1494,7 @@ class LyraWindow(QMainWindow):
             if not self._answer_mode_ok(mode):
                 return None
             ended = float(cq_end) if cq_end is not None else time.monotonic()
+            started = float(cq_start) if cq_start is not None else ended - _frame_s(mode)
             return {
                 "kind": "cq",
                 "call": second,
@@ -1471,6 +1504,7 @@ class LyraWindow(QMainWindow):
                 "fb": float(fb or 0.0),
                 "mode": str(mode or "").upper(),
                 "t": time.monotonic(),
+                "cq_start": started,
                 "cq_end": ended,
             }
         if (
@@ -1533,13 +1567,31 @@ class LyraWindow(QMainWindow):
 
         self._work_candidate(max(pool, key=score))
 
-    def _work_candidate(self, candidate: dict) -> None:
+    def _cq_heard_after_arm(self, candidate: dict) -> bool:
+        armed = float(self._answer_armed_at or 0.0)
+        if armed <= 0.0:
+            return False
+        start = float(candidate.get("cq_start") or 0.0)
+        if start <= 0.0:
+            mode = str(candidate.get("mode") or "F")
+            start = float(candidate.get("cq_end") or candidate.get("t") or 0.0) - _frame_s(mode)
+        return start >= armed
+
+    def _work_candidate(self, candidate: dict, *, forced: bool = False) -> None:
         if not self.auto_active or self.auto_qso is None or self.tx_session.busy:
             return
         call = str(candidate.get("call") or "").strip().upper()
         if call and self._is_worked(call) and not self._repeat_ok():
             return
-        if candidate.get("kind") == "cq" and candidate.get("fa") and candidate.get("fb"):
+        if candidate.get("kind") == "cq":
+            if not forced and not self._cq_heard_after_arm(candidate):
+                return
+            ch = self._channel_index(
+                float(candidate.get("fa") or 0.0),
+                float(candidate.get("fb") or 0.0),
+            )
+            if ch is not None:
+                self.tx_channel.setValue(ch)
             mode = str(candidate.get("mode") or "F").upper()
             if mode not in ("F", "L"):
                 mode = "F"
@@ -1547,15 +1599,11 @@ class LyraWindow(QMainWindow):
             self._cq_pool.clear()
             self._cq_pick_timer.stop()
             now = time.monotonic()
-            cq_end = float(candidate.get("cq_end") or now)
             jitter = random.uniform(0.0, ANSWER_JITTER_S)
             self._pending_answer = {
                 "candidate": candidate,
-                "fa": float(candidate["fa"]),
-                "fb": float(candidate["fb"]),
                 "jitter_s": jitter,
-                "cq_end": cq_end,
-                "tx_at": max(cq_end, now) + jitter,
+                "tx_at": now + jitter,
             }
             self._try_pending_answer()
             return
@@ -1589,7 +1637,7 @@ class LyraWindow(QMainWindow):
                 "Start Auto, Answer, or Manual first, then select the station to work.",
             )
             return
-        self._work_candidate(candidate)
+        self._work_candidate(candidate, forced=True)
 
     def _repeat_ok(self) -> bool:
         return (
@@ -1868,6 +1916,7 @@ class LyraWindow(QMainWindow):
             self.tx_operation,
         ):
             control.setEnabled(True)
+        self._sync_tx_channel_enabled()
         self.tx_status.setText("TX off")
 
     def _export_tx(self) -> None:
@@ -1925,6 +1974,7 @@ class LyraWindow(QMainWindow):
         self.tx_light.setStyleSheet(
             f"background:{color}; border-radius:5px; border:none;"
         )
+        self._paint_channel_regions(txing=on)
 
     def _unmute_tx_channel(self) -> None:
         if self.tx_session.busy:
@@ -1990,6 +2040,20 @@ class LyraWindow(QMainWindow):
             elif state == "listening":
                 self.tx_status.setText("TX on")
 
+    def _region_color(self, mid: float, txing: bool | None = None) -> str:
+        if txing is None:
+            txing = bool(self.tx_session.busy)
+        sel = int(self.tx_channel.value()) if hasattr(self, "tx_channel") else 0
+        idx = min(
+            range(len(CHANNELS)),
+            key=lambda j: abs(mid - 0.5 * (CHANNELS[j][0] + CHANNELS[j][1])),
+        )
+        if (idx + 1) == sel and txing:
+            return "#3ddc84"
+        if (idx + 1) == sel:
+            return "#ffffff"
+        return "#777777"
+
     def _make_region(self, plot, fa: float, fb: float, color: str):
         fill = QColor(color)
         fill.setAlpha(55)
@@ -2001,12 +2065,24 @@ class LyraWindow(QMainWindow):
             brush=fill,
             pen=pg.mkPen(color, width=2),
             hoverBrush=hover,
+            hoverPen=pg.mkPen(color, width=2),
             movable=False,
         )
         reg.setBounds((VIEW_LO, VIEW_HI))
-        reg.setZValue(20)
+        reg.setZValue(30 if color in ("#ffffff", "#3ddc84") else 20)
         plot.addItem(reg)
         return reg
+
+    def _paint_channel_regions(self, *_args, txing: bool | None = None) -> None:
+        if getattr(self, "_painting_regions", False):
+            return
+        if not self._mids or not hasattr(self, "plot"):
+            return
+        self._painting_regions = True
+        try:
+            self._rebuild_channels(len(self._mids), txing=txing)
+        finally:
+            self._painting_regions = False
 
     def _clear_regions(self) -> None:
         for reg in self._ch_spec + self._ch_wf:
@@ -2036,7 +2112,7 @@ class LyraWindow(QMainWindow):
         self._mids = [0.5 * (a + b) for a, b in plan]
         self._rebuild_channels(len(plan))
 
-    def _rebuild_channels(self, n: int) -> None:
+    def _rebuild_channels(self, n: int, txing: bool | None = None) -> None:
         n = max(0, min(len(CHANNELS), int(n)))
         self._syncing = True
         self._clear_regions()
@@ -2052,9 +2128,9 @@ class LyraWindow(QMainWindow):
             mids.append(defaults[len(mids)])
         self._mids = mids
         half = 0.5 * SPACING_HZ
-        for i, mid in enumerate(mids):
+        for mid in mids:
             fa, fb = mid - half, mid + half
-            col = CH_COLORS[i % len(CH_COLORS)]
+            col = self._region_color(mid, txing)
             self._ch_spec.append(self._make_region(self.plot, fa, fb, col))
             self._ch_wf.append(self._make_region(self.wf_plot, fa, fb, col))
         self._syncing = False
@@ -2096,6 +2172,9 @@ class LyraWindow(QMainWindow):
             self.rx_db.setText(f"{_snr_db(sl, fa0, fb0):+.0f} dB")
         else:
             self.rx_db.setText("dB  —")
+        if now - self._last_wf < WF_INTERVAL_S and self._wf is not None:
+            return
+        self._last_wf = now
         if self._wf is None or self._wf.shape[1] != len(mag_i):
             self._wf = np.repeat(mag_i[np.newaxis, :], WF_ROWS, axis=0)
         else:
@@ -2127,6 +2206,19 @@ class LyraWindow(QMainWindow):
                 return
         if origin != "tx" and not self.decode_on.isChecked():
             return
+        if origin != "tx":
+            msg_u = str(row.get("msg") or "").strip().upper()
+            if not msg_u.startswith("CQ "):
+                rx_key = (
+                    msg_u,
+                    round(float(row.get("fa") or 0.0)),
+                    round(float(row.get("fb") or 0.0)),
+                )
+                now_rx = time.monotonic()
+                prev_rx = self._recent_rx.get(rx_key)
+                if prev_rx is not None and now_rx - prev_rx < 6.5:
+                    return
+                self._recent_rx[rx_key] = now_rx
         decoded = row.get("decoded")
         if origin != "tx" and isinstance(decoded, tuple) and len(decoded) == 3:
             self._auto_hear(
@@ -2136,6 +2228,7 @@ class LyraWindow(QMainWindow):
                 float(row.get("fb") or 0.0),
                 str(row.get("mode") or ""),
                 float(row["cq_end"]) if row.get("cq_end") is not None else None,
+                float(row["cq_start"]) if row.get("cq_start") is not None else None,
             )
             self._watch_other_traffic(
                 decoded,
@@ -2175,6 +2268,7 @@ class LyraWindow(QMainWindow):
                     "fb": fb,
                     "mode": heard_mode,
                     "t": time.monotonic(),
+                    "cq_start": float(row["cq_start"]) if row.get("cq_start") is not None else 0.0,
                     "cq_end": float(row["cq_end"]) if row.get("cq_end") is not None else time.monotonic(),
                 }
             elif (
@@ -2386,6 +2480,10 @@ class LyraWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._save_station()
+        s = prefs.settings()
+        s.setValue("win_geo", self.saveGeometry())
+        s.setValue("win_docks", self.saveState())
+        s.sync()
         self.tx_session.stop()
         try:
             self.rig.disconnect()
@@ -2439,6 +2537,16 @@ QMainWindow, QWidget#root {
     color: @fg;
     font-family: Menlo, Monaco, "Courier New", monospace;
     font-size: 12px;
+}
+QDockWidget {
+    color: @fg;
+    titlebar-close-icon: none;
+}
+QDockWidget::title {
+    background: @input;
+    color: @fg;
+    padding: 4px 8px;
+    border: 1px solid @border;
 }
 QMenuBar {
     background: @bg;
