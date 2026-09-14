@@ -2059,13 +2059,14 @@ class LyraWindow(QMainWindow):
         fill.setAlpha(55)
         hover = QColor(color)
         hover.setAlpha(95)
+        none = pg.mkPen(None)
         reg = pg.LinearRegionItem(
             values=(fa, fb),
             orientation="vertical",
             brush=fill,
-            pen=pg.mkPen(color, width=2),
+            pen=none,
             hoverBrush=hover,
-            hoverPen=pg.mkPen(color, width=2),
+            hoverPen=none,
             movable=False,
         )
         reg.setBounds((VIEW_LO, VIEW_HI))
