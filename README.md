@@ -6,6 +6,14 @@ Lyra is an experimental digital radio mode for the amateur HF bands. It uses two
 
 There are two modes. Lyra F is the faster one (~2.3 s) and splits the message between the two rails. The chirp goes high to low. Lyra L is longer (~4.3 s) and sends the same data on both rails which can help if one rail is affected by fading. The chirp goes low to high. The chirp direction is what marks F vs L, not the channel.
 
+## first lyra
+
+First ever Lyra transmission. Thank you @nowords for helping test if transmission works.
+
+![First Lyra transmission](images/first_lyra_1.png)
+
+![First Lyra transmission 2](images/first_lyra_2.png)
+
 ## running
 
 You need Python 3. On macOS or Linux run:
