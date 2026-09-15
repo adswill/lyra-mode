@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from uuid import UUID, uuid4
+
 from PySide6.QtCore import QSettings
 
 from lyra.bands import DEFAULT_DIAL_HZ, parse_frequency
@@ -95,7 +97,9 @@ def station() -> tuple[str, str]:
     s = settings()
     call = str(s.value("call", "") or "").strip().upper()
     grid = str(s.value("grid", "") or "").strip().upper()
-    return call or "K1ABC", grid or "FN20"
+    if call == "K1ABC" and grid == "FN20":
+        return "", ""
+    return call, grid
 
 
 def save_station(call: str, grid: str) -> None:
@@ -120,6 +124,109 @@ def dial_hz() -> int:
 def save_dial(hz: int) -> None:
     s = settings()
     s.setValue("dial_hz", int(hz))
+    s.sync()
+
+
+def install_id() -> str:
+    s = settings()
+    raw = str(s.value("install_id", "") or "").strip().lower()
+    try:
+        return str(UUID(raw))
+    except ValueError:
+        value = str(uuid4())
+        s.setValue("install_id", value)
+        s.sync()
+        return value
+
+
+def _read_optional_int(key: str) -> int | None:
+    raw = settings().value(key, None)
+    if raw is None or raw == "":
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def audio_input() -> tuple[int | None, str]:
+    return _read_optional_int("audio_input_idx"), str(
+        settings().value("audio_input_name", "") or ""
+    ).strip()
+
+
+def audio_output() -> tuple[int | None, str]:
+    name = str(settings().value("audio_output_name", "") or "").strip()
+    if name.lower() == "test":
+        return None, ""
+    return _read_optional_int("audio_output_idx"), name
+
+
+def save_audio_input(idx: int | None, name: str) -> None:
+    s = settings()
+    s.setValue("audio_input_idx", "" if idx is None else int(idx))
+    s.setValue("audio_input_name", name.strip())
+    s.sync()
+
+
+def save_audio_output(idx: int | None, name: str) -> None:
+    s = settings()
+    s.setValue("audio_output_idx", "" if idx is None else int(idx))
+    s.setValue("audio_output_name", name.strip())
+    s.sync()
+
+
+def _read_bool(key: str, default: bool) -> bool:
+    raw = settings().value(key, default)
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in ("1", "true", "yes")
+
+
+def rig_settings() -> dict:
+    s = settings()
+    kind = str(s.value("rig_kind", "dummy") or "dummy").strip()
+    if kind not in ("dummy", "hamlib_local", "rigctld"):
+        kind = "dummy"
+    port = _read_optional_int("rig_port")
+    baud = str(s.value("rig_baud", "19200") or "19200").strip()
+    if baud not in ("1200", "4800", "9600", "19200", "38400", "57600", "115200"):
+        baud = "19200"
+    return {
+        "kind": kind,
+        "host": str(s.value("rig_host", "127.0.0.1") or "127.0.0.1").strip() or "127.0.0.1",
+        "port": port if port is not None else 4532,
+        "path": str(s.value("rig_path", "") or "").strip(),
+        "search": str(s.value("rig_search", "") or "").strip(),
+        "model": _read_optional_int("rig_model"),
+        "device": str(s.value("rig_device", "") or "").strip(),
+        "baud": baud,
+        "pktusb": _read_bool("rig_pktusb", True),
+    }
+
+
+def save_rig_settings(
+    *,
+    kind: str,
+    host: str,
+    port: int,
+    path: str,
+    search: str,
+    model: int | None,
+    device: str,
+    baud: str,
+    pktusb: bool,
+) -> None:
+    s = settings()
+    s.setValue("rig_kind", kind)
+    s.setValue("rig_host", host.strip())
+    s.setValue("rig_port", int(port))
+    s.setValue("rig_path", path.strip())
+    s.setValue("rig_search", search.strip())
+    s.setValue("rig_model", "" if model is None else int(model))
+    s.setValue("rig_device", device.strip())
+    s.setValue("rig_baud", baud)
+    s.setValue("rig_pktusb", bool(pktusb))
     s.sync()
 
 

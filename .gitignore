@@ -1,4 +1,5 @@
 .venv/
+.cursor/
 __pycache__/
 *.pyc
 .DS_Store
@@ -6,3 +7,13 @@ __pycache__/
 .mplconfig/
 iq/
 vendor/hamlib/.staging/
+presence/node_modules/
+presence/.wrangler/
+lyra/long_demo.py
+lyra/long_v2_demo.py
+lyra/gui_demo.py
+run_lyra_long_v2_demo
+run_lyra_long_v2_demo.bat
+example qso wavs/lyra_long_demo_qso_iq.wav
+example qso wavs/lyra_long_qso_iq.wav
+

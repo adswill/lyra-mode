@@ -24,15 +24,15 @@ You need Python 3. On macOS or Linux run:
 ./run_lyra
 ```
 
-For the long v2 demo:
-
-```shell
-./run_lyra_long_v2_demo
-```
-
-On Windows use `run_lyra.bat` or `run_lyra_long_v2_demo.bat`.
+On Windows use `run_lyra.bat`.
 
 The first start can take a while because it installs the needed packages.
+
+## network
+
+On launch Lyra asks if you want to connect to the network. That is optional and not remembered.
+
+The network is only a live count of how many people have Lyra open. It does not send your callsign, grid, or audio. Use it if you want to see whether anyone else is around; skip it if you do not.
 
 ## using it
 
@@ -88,7 +88,7 @@ Leave packet USB on if your radio has a data / USB-D / packet mode. That keeps t
 
 To test without a radio, open Lyra twice and connect both windows with a virtual audio cable. BlackHole can be used on macOS and VB-Cable can be used on Windows. Keep the rig option on Test.
 
-The example qso wavs folder has some example QSOs you can open in SDR++. For the long v2 one, run `./run_lyra_long_v2_demo` and open the wav from the file menu.
+The example qso wavs folder has some example QSOs you can open in SDR++ or with File → Open WAV.
 
 ## license
 

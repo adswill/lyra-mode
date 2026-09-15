@@ -12,13 +12,13 @@ from queue import Empty, SimpleQueue
 
 import numpy as np
 
-from lyra.capture import AudioTap, default_input_index, list_inputs, load_sounddevice
+from lyra.capture import AudioTap, list_inputs, load_sounddevice
 from lyra.codec import decode_usb_all, heartbeat_bits
 from lyra import codec as lyra_codec
 from lyra.qso_auto import AutoAction, AutoQso, _is_grid, _is_rpt
 from lyra.hamlib import LocalRigctld, bundled_hamlib_dir, find_rigctld, list_models, list_serial_ports
 from lyra.rig import DummyRig, RigctldRig
-from lyra.tx import TxSession, build_tx_audio, list_outputs, write_tx_wav
+from lyra.tx import TxSession, build_tx_audio, build_tune_audio, list_outputs, write_tx_wav
 from lyra.bands import CUSTOM_LABEL, PRESETS, format_mhz, parse_frequency
 from lyra.const import (
     BIT_RATE,
@@ -104,9 +104,15 @@ from PySide6.QtWidgets import (
 import pyqtgraph as pg
 
 from lyra import geo
+from lyra import network
 from lyra import prefs
+from lyra import update as lyra_update
 
 CAND_ROLE = int(Qt.ItemDataRole.UserRole) + 1
+
+
+class _NetBridge(QObject):
+    done = Signal(object)
 
 
 def _frame_s(mode: str) -> float:
@@ -312,6 +318,46 @@ class TxBridge(QObject):
     status = Signal(str, bool)
 
 
+class _HashBounce(QLabel):
+    WIDTH = 16
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._i = 0
+        self._dir = 1
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._step)
+        self._draw()
+
+    def start(self) -> None:
+        self._i = 0
+        self._dir = 1
+        self.show()
+        self._draw()
+        self._timer.start(90)
+
+    def stop(self) -> None:
+        self._timer.stop()
+        self.hide()
+
+    def _step(self) -> None:
+        self._i += self._dir
+        last = self.WIDTH - 1
+        if self._i >= last:
+            self._i = last
+            self._dir = -1
+        elif self._i <= 0:
+            self._i = 0
+            self._dir = 1
+        self._draw()
+
+    def _draw(self) -> None:
+        cells = ["-"] * self.WIDTH
+        cells[self._i] = "#"
+        self.setText("[" + "".join(cells) + "]")
+
+
 class LyraWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -323,6 +369,7 @@ class LyraWindow(QMainWindow):
         self.tx_bridge = TxBridge()
         self.tx_bridge.status.connect(self._on_tx_status)
         self.rig = DummyRig()
+        self._tuning = False
         self._wf = None
         self._echo_until = 0.0
         self._echo_msg = ""
@@ -492,6 +539,7 @@ class LyraWindow(QMainWindow):
 
     def _build(self) -> None:
         pg.setConfigOptions(antialias=False, background="#000000", foreground="#777777")
+        self.setMinimumSize(960, 640)
         self.setDockNestingEnabled(True)
         self.setDockOptions(
             QMainWindow.DockOption.AnimatedDocks
@@ -537,15 +585,21 @@ class LyraWindow(QMainWindow):
         top.addWidget(self.dial)
         top.addWidget(QLabel("USB"))
         top.addStretch(1)
-        top.addWidget(QLabel("audio"))
+        top.addWidget(QLabel("output"))
+        self.tx_dev = QComboBox()
+        self.tx_dev.setMinimumWidth(180)
+        self.tx_dev.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.tx_dev.currentIndexChanged.connect(self._on_output)
+        top.addWidget(self.tx_dev, 1)
+        top.addWidget(QLabel("input"))
         self.dev = QComboBox()
-        self.dev.setMinimumWidth(220)
+        self.dev.setMinimumWidth(180)
         self.dev.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.dev.currentIndexChanged.connect(self._on_device)
         top.addWidget(self.dev, 1)
         ref = QPushButton("refresh")
         ref.setFixedWidth(72)
-        ref.clicked.connect(self._load_devices)
+        ref.clicked.connect(self._refresh_audio)
         top.addWidget(ref)
         top.addWidget(self._vline())
         top.addWidget(QLabel("rx"))
@@ -710,14 +764,6 @@ class LyraWindow(QMainWindow):
         )
         self._docks = (listen_dock, tx_dock, act_dock, qso_dock, ch_dock, graph_dock)
 
-        self.addDockWidget(Qt.DockWidgetArea.TopDockWidgetArea, listen_dock)
-        self.splitDockWidget(listen_dock, tx_dock, Qt.Orientation.Vertical)
-        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, graph_dock)
-        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, act_dock)
-        self.splitDockWidget(graph_dock, act_dock, Qt.Orientation.Vertical)
-        self.splitDockWidget(act_dock, qso_dock, Qt.Orientation.Horizontal)
-        self.splitDockWidget(qso_dock, ch_dock, Qt.Orientation.Vertical)
-
         view_m = self.menuBar().addMenu("&View")
         for dock in self._docks:
             view_m.addAction(dock.toggleViewAction())
@@ -725,38 +771,93 @@ class LyraWindow(QMainWindow):
         reset_lay.triggered.connect(self._reset_layout)
         view_m.addSeparator()
         view_m.addAction(reset_lay)
-
-        geo = prefs.settings().value("win_geo")
-        st = prefs.settings().value("win_docks")
-        if geo is not None:
-            self.restoreGeometry(geo)
-        if st is not None:
-            self.restoreState(st)
+        self._restore_window()
 
         sb = QStatusBar()
         self.setStatusBar(sb)
         self.utc_lab = QLabel("")
         self.dev_lab = QLabel("idle")
+        self.net_lab = QLabel("")
+        self.net_lab.hide()
         sb.addWidget(self.utc_lab)
         sb.addWidget(self.dev_lab, 1)
+        sb.addPermanentWidget(self.net_lab)
+        self._net_session = ""
+        self._net_busy = False
+        self._net_kind = ""
+        self._net_dlg = None
+        self._net_dlg_lab = None
+        self._net_dlg_btns = None
+        self._net_dlg_ship = None
+        self._net_timer = QTimer(self)
+        self._net_timer.timeout.connect(self._net_heartbeat)
+        self._net_bridge = _NetBridge(self)
+        self._net_bridge.done.connect(
+            self._on_net_result, Qt.ConnectionType.QueuedConnection
+        )
+        self._update_bridge = _NetBridge(self)
+        self._update_bridge.done.connect(
+            self._on_update_result, Qt.ConnectionType.QueuedConnection
+        )
+
+    def _docks_usable(self) -> bool:
+        if self.width() < 640 or self.height() < 400:
+            return False
+        shown = [dock for dock in self._docks if dock.isVisible() and not dock.isFloating()]
+        return len(shown) >= 5
+
+    def _restore_window(self) -> None:
+        geo = prefs.settings().value("win_geo")
+        st = prefs.settings().value("win_docks")
+        if geo is not None:
+            self.restoreGeometry(geo)
+        restored = False
+        if st is not None:
+            restored = bool(self.restoreState(st))
+        if self.width() < 640 or self.height() < 400:
+            self.resize(1520, 940)
+        if not restored or not self._docks_usable():
+            self._apply_default_layout()
+
+    def _apply_default_layout(self) -> None:
+        listen, tx, act, qso, ch, graph = self._docks
+        if self.width() < 960 or self.height() < 640:
+            self.resize(1520, 940)
+        for dock in self._docks:
+            dock.setFloating(False)
+            dock.show()
+        self.addDockWidget(Qt.DockWidgetArea.TopDockWidgetArea, listen)
+        self.addDockWidget(Qt.DockWidgetArea.TopDockWidgetArea, tx)
+        self.splitDockWidget(listen, tx, Qt.Orientation.Vertical)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, act)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, graph)
+        self.splitDockWidget(act, graph, Qt.Orientation.Horizontal)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, qso)
+        self.splitDockWidget(act, qso, Qt.Orientation.Vertical)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, ch)
+        self.splitDockWidget(graph, ch, Qt.Orientation.Vertical)
+        QTimer.singleShot(0, self._size_default_docks)
+
+    def _size_default_docks(self) -> None:
+        listen, tx, act, qso, ch, graph = self._docks
+        w = max(self.width(), 960)
+        h = max(self.height(), 640)
+        top = 64
+        self.resizeDocks([listen, tx], [top, top], Qt.Orientation.Vertical)
+        body = max(h - 2 * top - 48, 360)
+        upper = int(body * 0.58)
+        lower = body - upper
+        self.resizeDocks([act, qso], [upper, lower], Qt.Orientation.Vertical)
+        self.resizeDocks([graph, ch], [upper, lower], Qt.Orientation.Vertical)
+        left = int(w * 0.48)
+        self.resizeDocks([act, graph], [left, max(w - left, 320)], Qt.Orientation.Horizontal)
 
     def _reset_layout(self) -> None:
         prefs.settings().remove("win_docks")
         prefs.settings().remove("win_geo")
         prefs.settings().sync()
-        listen, tx, act, qso, ch, graph = self._docks
-        for dock in self._docks:
-            dock.setFloating(False)
-            dock.show()
-            self.removeDockWidget(dock)
-            self.addDockWidget(Qt.DockWidgetArea.TopDockWidgetArea, dock)
-            dock.show()
-        self.addDockWidget(Qt.DockWidgetArea.TopDockWidgetArea, listen)
-        self.splitDockWidget(listen, tx, Qt.Orientation.Vertical)
-        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, graph)
-        self.splitDockWidget(graph, act, Qt.Orientation.Vertical)
-        self.splitDockWidget(act, qso, Qt.Orientation.Horizontal)
-        self.splitDockWidget(qso, ch, Qt.Orientation.Vertical)
+        self.resize(1520, 940)
+        self._apply_default_layout()
 
     def _build_tx_panel(self) -> QWidget:
         box = QWidget()
@@ -767,12 +868,14 @@ class LyraWindow(QMainWindow):
         row.addWidget(QLabel("call"))
         saved_call, saved_grid = prefs.station()
         self.my_call = QLineEdit(saved_call)
-        self.my_call.setFixedWidth(82)
+        self.my_call.setPlaceholderText("(callsign)")
+        self.my_call.setFixedWidth(96)
         self.my_call.editingFinished.connect(self._save_station)
         row.addWidget(self.my_call)
         row.addWidget(QLabel("grid"))
         self.my_grid = QLineEdit(saved_grid)
-        self.my_grid.setFixedWidth(58)
+        self.my_grid.setPlaceholderText("(grid)")
+        self.my_grid.setFixedWidth(64)
         self.my_grid.editingFinished.connect(self._save_station)
         row.addWidget(self.my_grid)
         row.addWidget(QLabel("mode"))
@@ -808,6 +911,13 @@ class LyraWindow(QMainWindow):
         setup = QPushButton("radio")
         setup.clicked.connect(self._open_tx_setup)
         row.addWidget(setup)
+        self.rig_light = QFrame()
+        self.rig_light.setFixedSize(10, 10)
+        row.addWidget(self.rig_light)
+        self._set_rig_light(False)
+        self.tx_tune = QPushButton("tune")
+        self.tx_tune.clicked.connect(self._on_tune)
+        row.addWidget(self.tx_tune)
         self.tx_button = QPushButton("start")
         self.tx_button.clicked.connect(self._start_tx)
         row.addWidget(self.tx_button)
@@ -824,52 +934,74 @@ class LyraWindow(QMainWindow):
         self._set_tx_light(False)
 
         
-        self.rig_kind = QComboBox()
+        self._loading_rig = True
+        self.rig_kind = QComboBox(self)
         self.rig_kind.addItem("Test", "dummy")
         self.rig_kind.addItem("Hamlib", "hamlib_local")
         self.rig_kind.addItem("Hamlib network", "rigctld")
         self.rig_kind.currentIndexChanged.connect(self._on_rig_kind)
-        self.rig_host = QLineEdit("127.0.0.1")
+        self.rig_host = QLineEdit("127.0.0.1", self)
         self.rig_host.setFixedWidth(105)
-        self.rig_port = QSpinBox()
+        self.rig_port = QSpinBox(self)
         self.rig_port.setRange(1, 65535)
         self.rig_port.setValue(4532)
         self.rig_port.setFixedWidth(76)
-        self.rig_hamlib_path = QLineEdit()
+        self.rig_hamlib_path = QLineEdit(self)
         bundled = bundled_hamlib_dir()
         if bundled is not None:
             self.rig_hamlib_path.setText(str(bundled))
         self.rig_hamlib_path.setPlaceholderText("hamlib folder or rigctld")
-        self.rig_browse = QPushButton("browse")
+        self.rig_browse = QPushButton("browse", self)
         self.rig_browse.clicked.connect(self._browse_hamlib)
-        self.rig_search = QLineEdit()
+        self.rig_search = QLineEdit(self)
         self.rig_search.setPlaceholderText("search name or id")
         self.rig_search.textChanged.connect(self._filter_rig_models)
-        self.rig_model = QComboBox()
+        self.rig_model = QComboBox(self)
         self.rig_model.setMinimumWidth(220)
-        self.rig_device = QComboBox()
+        self.rig_device = QComboBox(self)
         self.rig_device.setEditable(True)
         self.rig_device.setMinimumWidth(110)
-        self.rig_baud = QComboBox()
+        self.rig_baud = QComboBox(self)
         for rate in ("1200", "4800", "9600", "19200", "38400", "57600", "115200"):
             self.rig_baud.addItem(rate)
         self.rig_baud.setCurrentText("19200")
-        self.rig_pktusb = QCheckBox("packet USB")
+        self.rig_pktusb = QCheckBox("packet USB", self)
         self.rig_pktusb.setChecked(True)
-        self.rig_pktusb.toggled.connect(lambda _on: setattr(self, "_radio_mode", None))
-        self.rig_connect = QPushButton("connect")
+        self.rig_pktusb.toggled.connect(self._on_pktusb)
+        self.rig_connect = QPushButton("connect", self)
         self.rig_connect.clicked.connect(self._connect_rig)
-        self.rig_status = QLabel("test ready")
+        self.rig_status = QLabel("test ready", self)
         self.rig_status.setMinimumWidth(125)
         self._hamlib = LocalRigctld()
         self._rig_models: list[tuple[int, str]] = []
-        self.tx_dev = QComboBox()
-        self.tx_dev.setMinimumWidth(230)
+        for widget in (
+            self.rig_kind,
+            self.rig_host,
+            self.rig_port,
+            self.rig_hamlib_path,
+            self.rig_browse,
+            self.rig_search,
+            self.rig_model,
+            self.rig_device,
+            self.rig_baud,
+            self.rig_pktusb,
+            self.rig_connect,
+            self.rig_status,
+        ):
+            widget.hide()
         self._setup_dialog = None
         self.auto_qso: AutoQso | None = None
         self.auto_active = False
         self._tx_label = ""
-        self._on_rig_kind()
+        self.rig_host.editingFinished.connect(self._save_rig)
+        self.rig_port.valueChanged.connect(lambda _v: self._save_rig())
+        self.rig_hamlib_path.editingFinished.connect(self._save_rig)
+        self.rig_search.editingFinished.connect(self._save_rig)
+        self.rig_model.currentIndexChanged.connect(lambda _i: self._save_rig())
+        self.rig_device.currentIndexChanged.connect(lambda _i: self._save_rig())
+        self.rig_device.editTextChanged.connect(lambda _t: self._save_rig())
+        self.rig_baud.currentIndexChanged.connect(lambda _i: self._save_rig())
+        self._apply_rig_prefs()
         self._on_operation_changed()
         return box
 
@@ -882,33 +1014,104 @@ class LyraWindow(QMainWindow):
     def _load_devices(self) -> None:
         self._loading_dev = True
         self.dev.clear()
+        self.dev.addItem("(select input)", None)
         sd = load_sounddevice()
         devices = list_inputs(sd)
-        prefer = default_input_index(sd)
+        saved_idx, saved_name = prefs.audio_input()
         sel = 0
-        for n, (i, name, ch) in enumerate(devices):
+        saved_sel = -1
+        name_sel = -1
+        for n, (i, name, ch) in enumerate(devices, start=1):
             self.dev.addItem(f"{name}   (#{i}, {ch} ch)", i)
-            if prefer is not None and i == prefer:
-                sel = n
-        if devices:
-            self.dev.setCurrentIndex(sel)
+            if saved_name and name == saved_name:
+                if name_sel < 0:
+                    name_sel = n
+                if saved_idx is not None and i == saved_idx:
+                    saved_sel = n
+            elif saved_idx is not None and i == saved_idx and saved_name:
+                saved_sel = n
+        if saved_sel >= 0:
+            sel = saved_sel
+        elif name_sel >= 0:
+            sel = name_sel
+        self.dev.setCurrentIndex(sel)
         self._loading_dev = False
 
+    def _refresh_audio(self) -> None:
+        self._load_devices()
+        self._load_outputs()
+
     def _load_outputs(self) -> None:
+        self._loading_out = True
         self.tx_dev.clear()
-        self.tx_dev.addItem("Test", None)
+        self.tx_dev.addItem("(select output)", None)
+        saved_idx, saved_name = prefs.audio_output()
+        sel = 0
         try:
             sd = load_sounddevice()
-            for idx, name, channels in list_outputs(sd):
+            saved_sel = -1
+            name_sel = -1
+            for n, (idx, name, channels) in enumerate(list_outputs(sd), start=1):
                 self.tx_dev.addItem(f"{name}   (#{idx}, {channels} ch)", idx)
-            self.tx_dev.setCurrentIndex(0)
+                if saved_name and name == saved_name:
+                    if name_sel < 0:
+                        name_sel = n
+                    if saved_idx is not None and idx == saved_idx:
+                        saved_sel = n
+                elif saved_idx is not None and idx == saved_idx and saved_name:
+                    saved_sel = n
+            if saved_sel >= 0:
+                sel = saved_sel
+            elif name_sel >= 0:
+                sel = name_sel
+            self.tx_dev.setCurrentIndex(sel)
         except Exception as exc:
             self.tx_status.setText(f"Audio output unavailable: {exc}")
+        self._loading_out = False
+
+    def _combo_device_name(self, box: QComboBox) -> str:
+        data = box.currentData()
+        text = box.currentText()
+        if data is None:
+            return ""
+        mark = "   (#"
+        cut = text.rfind(mark)
+        return text[:cut] if cut >= 0 else text
+
+    def _save_audio(self) -> None:
+        in_idx = self.dev.currentData()
+        prefs.save_audio_input(
+            None if in_idx is None else int(in_idx),
+            self._combo_device_name(self.dev),
+        )
+        out_idx = self.tx_dev.currentData()
+        prefs.save_audio_output(
+            None if out_idx is None else int(out_idx),
+            self._combo_device_name(self.tx_dev),
+        )
 
     def _on_rig_kind(self, _index: int = 0) -> None:
         kind = self.rig_kind.currentData()
         local = kind == "hamlib_local"
         network = kind == "rigctld"
+        if not getattr(self, "_loading_rig", False):
+            try:
+                self.rig.disconnect()
+            except Exception:
+                pass
+            self.rig = DummyRig()
+            self._set_rig_light(False)
+        if self._setup_dialog is None:
+            if local:
+                self._reload_serial_ports()
+                self._reload_hamlib_models()
+                self.rig_status.setText("not connected")
+            elif network:
+                self.rig_status.setText("not connected")
+            else:
+                self.rig_status.setText("test ready")
+            self._save_rig()
+            return
         self.rig_host.setVisible(network)
         self.rig_host.setEnabled(network)
         self.rig_port.setVisible(local or network)
@@ -931,6 +1134,58 @@ class LyraWindow(QMainWindow):
             self.rig_status.setText("not connected")
         else:
             self.rig_status.setText("test ready")
+        self._save_rig()
+
+    def _on_pktusb(self, _on: bool) -> None:
+        self._radio_mode = None
+        self._save_rig()
+
+    def _apply_rig_prefs(self) -> None:
+        self._loading_rig = True
+        saved = prefs.rig_settings()
+        idx = self.rig_kind.findData(saved["kind"])
+        if idx >= 0:
+            self.rig_kind.setCurrentIndex(idx)
+        self.rig_host.setText(saved["host"])
+        self.rig_port.setValue(int(saved["port"]))
+        if saved["path"]:
+            self.rig_hamlib_path.setText(saved["path"])
+        self.rig_baud.setCurrentText(saved["baud"])
+        self.rig_pktusb.setChecked(bool(saved["pktusb"]))
+        self.rig_search.blockSignals(True)
+        self.rig_search.setText(saved["search"])
+        self.rig_search.blockSignals(False)
+        self._on_rig_kind()
+        if saved["model"] is not None:
+            midx = self.rig_model.findData(saved["model"])
+            if midx >= 0:
+                self.rig_model.setCurrentIndex(midx)
+            else:
+                self.rig_model.addItem(str(saved["model"]), saved["model"])
+                self.rig_model.setCurrentIndex(self.rig_model.count() - 1)
+        if saved["device"]:
+            pidx = self.rig_device.findText(saved["device"])
+            if pidx >= 0:
+                self.rig_device.setCurrentIndex(pidx)
+            else:
+                self.rig_device.setEditText(saved["device"])
+        self._loading_rig = False
+
+    def _save_rig(self) -> None:
+        if getattr(self, "_loading_rig", False):
+            return
+        model = self.rig_model.currentData()
+        prefs.save_rig_settings(
+            kind=str(self.rig_kind.currentData() or "dummy"),
+            host=self.rig_host.text(),
+            port=int(self.rig_port.value()),
+            path=self.rig_hamlib_path.text(),
+            search=self.rig_search.text(),
+            model=None if model is None else int(model),
+            device=self.rig_device.currentText(),
+            baud=self.rig_baud.currentText(),
+            pktusb=self.rig_pktusb.isChecked(),
+        )
 
     def _apply_radio_mode(self) -> None:
         want = "PKTUSB" if self.rig_pktusb.isChecked() else "USB"
@@ -998,10 +1253,18 @@ class LyraWindow(QMainWindow):
             self._radio_mode = None
             self._prepare_radio()
         except Exception as exc:
+            try:
+                self.rig.disconnect()
+            except Exception:
+                pass
+            self._set_rig_light(False)
             self.rig_status.setText("Connection failed")
             QMessageBox.warning(self, "Lyra rig control", str(exc))
             return False
+        hamlib = kind in ("hamlib_local", "rigctld")
+        self._set_rig_light(hamlib)
         self.rig_status.setText(f"{self.rig.name} connected")
+        self._save_rig()
         return True
 
     def _browse_hamlib(self) -> None:
@@ -1010,6 +1273,7 @@ class LyraWindow(QMainWindow):
             return
         self.rig_hamlib_path.setText(path)
         self._reload_hamlib_models()
+        self._save_rig()
 
     def _reload_serial_ports(self) -> None:
         current = self.rig_device.currentText()
@@ -1103,20 +1367,20 @@ class LyraWindow(QMainWindow):
             ham_port.addWidget(self.rig_pktusb)
             lay.addLayout(ham_port)
             lay.addWidget(self.rig_status)
-            audio_row = QHBoxLayout()
-            audio_row.addWidget(QLabel("audio"))
-            audio_row.addWidget(self.tx_dev, 1)
-            refresh = QPushButton("refresh")
-            refresh.clicked.connect(self._load_outputs)
-            audio_row.addWidget(refresh)
+            wav_row = QHBoxLayout()
             export = QPushButton("save wav")
             export.clicked.connect(self._export_tx)
-            audio_row.addWidget(export)
-            lay.addLayout(audio_row)
+            wav_row.addWidget(export)
+            wav_row.addStretch(1)
+            lay.addLayout(wav_row)
             close = QPushButton("close")
             close.clicked.connect(dialog.close)
             lay.addWidget(close, alignment=Qt.AlignmentFlag.AlignRight)
             self._setup_dialog = dialog
+            self.rig_kind.show()
+            self.rig_connect.show()
+            self.rig_status.show()
+            self._on_rig_kind()
         self._setup_dialog.show()
         self._setup_dialog.raise_()
         self._setup_dialog.activateWindow()
@@ -1130,7 +1394,7 @@ class LyraWindow(QMainWindow):
         )
 
     def _start_tx(self) -> None:
-        if self.auto_active or self.tx_session.busy:
+        if self.auto_active or self.tx_session.busy or self._tuning:
             return
         try:
             controller = AutoQso(
@@ -1141,21 +1405,11 @@ class LyraWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self, "Lyra automatic TX", f"Check call and grid:\n{exc}")
             return
+        if self.tx_dev.currentData() is None:
+            QMessageBox.warning(self, "Lyra automatic TX", "Pick an audio output.")
+            return
         if not getattr(self.rig, "connected", False) and not self._connect_rig():
             return
-        if self.rig_kind.currentData() in ("rigctld", "hamlib_local"):
-            manual = controller.operation == AutoQso.MANUAL_CQ
-            answer = QMessageBox.question(
-                self,
-                "Start one QSO?" if manual else "Start automatic transmission?",
-                "Lyra will call CQ and key the radio until one QSO is complete."
-                if manual
-                else "Lyra will key the connected radio automatically until Stop is pressed.",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if answer != QMessageBox.StandardButton.Yes:
-                return
         self.auto_qso = controller
         self.auto_active = True
         self._reset_qso_log()
@@ -1177,6 +1431,7 @@ class LyraWindow(QMainWindow):
         ):
             control.setEnabled(False)
         self.tx_button.setEnabled(False)
+        self.tx_tune.setEnabled(False)
         self.tx_stop.setEnabled(True)
         self.tx_status.setText("TX on")
         action = controller.start()
@@ -1216,6 +1471,9 @@ class LyraWindow(QMainWindow):
             QMessageBox.warning(self, "Lyra automatic TX", str(exc))
 
     def _stop_tx(self) -> None:
+        if self._tuning:
+            self.tx_session.stop()
+            return
         self.auto_active = False
         self.auto_qso = None
         self._pending_tx_log = None
@@ -1232,6 +1490,7 @@ class LyraWindow(QMainWindow):
         self._set_tx_light(False)
         self.tx_status.setText("TX off")
         self.tx_button.setEnabled(True)
+        self.tx_tune.setEnabled(True)
         self.tx_stop.setEnabled(False)
         for control in (
             self.my_call,
@@ -1243,12 +1502,74 @@ class LyraWindow(QMainWindow):
             control.setEnabled(True)
         self._sync_tx_channel_enabled()
 
+    def _on_tune(self) -> None:
+        if self._tuning:
+            self.tx_session.stop()
+            return
+        if self.auto_active or self.tx_session.busy:
+            return
+        if self.tx_dev.currentData() is None:
+            QMessageBox.warning(self, "Lyra tune", "Pick an audio output.")
+            return
+        if not getattr(self.rig, "connected", False) and not self._connect_rig():
+            return
+        try:
+            self._prepare_radio()
+            audio = build_tune_audio(
+                channel=self.tx_channel.value(),
+                level=self.tx_level.value() / 100.0,
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Lyra tune", str(exc))
+            return
+        self._tuning = True
+        self.tx_button.setEnabled(False)
+        self.tx_tune.setEnabled(True)
+        self.tx_stop.setEnabled(True)
+        self.worker.mute_channel = int(self.tx_channel.value())
+        self.tx_status.setText("Tune")
+        self._set_tx_light(True)
+        try:
+            self.tx_session.start(
+                audio,
+                output_device=self.tx_dev.currentData(),
+                rig=self.rig,
+                callback=lambda message, done: self.tx_bridge.status.emit(message, done),
+            )
+        except Exception as exc:
+            self._tuning = False
+            self.worker.mute_channel = None
+            self._set_tx_light(False)
+            self.tx_button.setEnabled(True)
+            self.tx_stop.setEnabled(False)
+            self.tx_status.setText("TX off")
+            QMessageBox.warning(self, "Lyra tune", str(exc))
+
+    def _finish_tune(self, message: str) -> None:
+        self._tuning = False
+        self.worker.decode_enabled = self.decode_on.isChecked()
+        self._set_tx_light(False)
+        if self.worker.tap is not None:
+            self.worker.tap.clear()
+        QTimer.singleShot(400, self._unmute_tx_channel)
+        self.tx_button.setEnabled(True)
+        self.tx_tune.setEnabled(True)
+        self.tx_stop.setEnabled(False)
+        self.tx_status.setText("TX off")
+        if message.startswith("TX error"):
+            QMessageBox.warning(self, "Lyra tune", message)
+
     def _on_tx_status(self, message: str, done: bool) -> None:
         if not done:
             self.worker.decode_enabled = self.decode_on.isChecked()
             self._set_tx_light(True)
-            if self.auto_active:
+            if self._tuning:
+                self.tx_status.setText("Tune")
+            elif self.auto_active:
                 self.tx_status.setText("TX on")
+            return
+        if self._tuning:
+            self._finish_tune(message)
             return
         self.worker.decode_enabled = self.decode_on.isChecked()
         self._set_tx_light(False)
@@ -1907,6 +2228,7 @@ class LyraWindow(QMainWindow):
         self.auto_qso = None
         self._auto_generation += 1
         self.tx_button.setEnabled(True)
+        self.tx_tune.setEnabled(True)
         self.tx_stop.setEnabled(False)
         for control in (
             self.my_call,
@@ -1945,15 +2267,201 @@ class LyraWindow(QMainWindow):
     def _on_device(self, _idx: int) -> None:
         if getattr(self, "_loading_dev", False):
             return
+        self._save_audio()
         if self.monitor.isChecked():
             self._start_rx()
 
+    def _on_output(self, _idx: int) -> None:
+        if getattr(self, "_loading_out", False):
+            return
+        self._save_audio()
+
     def _startup_notice(self) -> None:
-        QMessageBox.information(
-            self,
-            "Lyra",
-            "Hey, this project is constantly being updated, please make sure to check for new updates regularly!",
+        box = QMessageBox(self)
+        box.setWindowTitle("Lyra")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText(
+            "Hey, this project is constantly being updated, please make sure to check for new updates regularly!"
         )
+        box.setInformativeText("Would you like to check for new updates?")
+        yes = box.addButton("Yes", QMessageBox.ButtonRole.YesRole)
+        box.addButton("No", QMessageBox.ButtonRole.NoRole)
+        box.setDefaultButton(yes)
+        box.exec()
+        if box.clickedButton() is yes:
+            self._begin_update_check()
+            return
+        self._ask_network()
+
+    def _begin_update_check(self) -> None:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Lyra")
+        dlg.setModal(True)
+        dlg.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel("Checking for updates…"))
+        self._update_dlg = dlg
+        dlg.show()
+        bridge = self._update_bridge
+
+        def work() -> None:
+            try:
+                bridge.done.emit(lyra_update.check())
+            except Exception as exc:
+                bridge.done.emit(exc)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_update_result(self, result: object) -> None:
+        if getattr(self, "_update_dlg", None) is not None:
+            self._update_dlg.close()
+            self._update_dlg = None
+        if isinstance(result, Exception):
+            text = "Could not check for updates."
+        else:
+            text = str(result)
+        QMessageBox.information(self, "Lyra", text)
+        self._ask_network()
+
+    def _ask_network(self) -> None:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Lyra")
+        dlg.setModal(True)
+        dlg.setAttribute(Qt.WidgetAttribute.WA_AlwaysShowToolTips, True)
+        lay = QVBoxLayout(dlg)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Connect to the network?"))
+        hint = QLabel("?")
+        hint.setToolTip(network.HELP)
+        hint.setToolTipDuration(20000)
+        hint.setCursor(Qt.CursorShape.WhatsThisCursor)
+        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        hint.setFixedSize(18, 18)
+        hint.setStyleSheet(
+            "QLabel { color: #808080; border: 1px solid #3a3a3a; border-radius: 9px; }"
+        )
+        row.addWidget(hint)
+        row.addStretch(1)
+        lay.addLayout(row)
+        btns = QDialogButtonBox()
+        yes = btns.addButton("Yes", QDialogButtonBox.ButtonRole.YesRole)
+        no = btns.addButton("No", QDialogButtonBox.ButtonRole.NoRole)
+        yes.setDefault(True)
+        yes.clicked.connect(dlg.accept)
+        no.clicked.connect(dlg.reject)
+        lay.addWidget(btns)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._show_connecting()
+        self._kick_heartbeat("connect", network.new_session_id())
+
+    def _show_connecting(self) -> None:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Lyra")
+        dlg.setModal(True)
+        dlg.setMinimumWidth(360)
+        dlg.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
+        lay = QVBoxLayout(dlg)
+        lay.setSpacing(10)
+        lab = QLabel("Connecting to the network…")
+        lay.addWidget(lab)
+        ship = _HashBounce(dlg)
+        lay.addWidget(ship)
+        btns = QDialogButtonBox()
+        retry = btns.addButton("Retry", QDialogButtonBox.ButtonRole.AcceptRole)
+        close = btns.addButton("Close", QDialogButtonBox.ButtonRole.RejectRole)
+        retry.clicked.connect(self._retry_network)
+        close.clicked.connect(self._cancel_network)
+        btns.hide()
+        lay.addWidget(btns)
+        self._net_dlg = dlg
+        self._net_dlg_lab = lab
+        self._net_dlg_btns = btns
+        self._net_dlg_ship = ship
+        dlg.show()
+        ship.start()
+
+    def _start_net_progress(self) -> None:
+        if self._net_dlg_ship is None:
+            return
+        self._net_dlg_ship.start()
+
+    def _stop_net_progress(self, *, done: bool) -> None:
+        if self._net_dlg_ship is None:
+            return
+        self._net_dlg_ship.stop()
+
+    def _retry_network(self) -> None:
+        if self._net_busy or self._net_dlg is None:
+            return
+        assert self._net_dlg_lab is not None
+        assert self._net_dlg_btns is not None
+        self._net_dlg_lab.setText("Connecting to the network…")
+        self._net_dlg_btns.hide()
+        self._start_net_progress()
+        self._kick_heartbeat("connect", network.new_session_id())
+
+    def _cancel_network(self) -> None:
+        self._stop_net_progress(done=False)
+        if self._net_dlg is not None:
+            self._net_dlg.close()
+            self._net_dlg = None
+            self._net_dlg_lab = None
+            self._net_dlg_btns = None
+            self._net_dlg_ship = None
+        self._net_session = ""
+        self._net_timer.stop()
+        self.net_lab.hide()
+
+    def _kick_heartbeat(self, kind: str, session_id: str) -> None:
+        if self._net_busy:
+            return
+        self._net_busy = True
+        self._net_kind = kind
+        self._net_session = session_id
+        sid = session_id
+        bridge = self._net_bridge
+
+        def work() -> None:
+            try:
+                bridge.done.emit(
+                    network.heartbeat(
+                        network.DEFAULT_URL, sid, prefs.install_id()
+                    )
+                )
+            except Exception as exc:
+                bridge.done.emit(exc)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _net_heartbeat(self) -> None:
+        if not self._net_session:
+            return
+        self._kick_heartbeat("beat", self._net_session)
+
+    def _on_net_result(self, result: object) -> None:
+        self._net_busy = False
+        kind = self._net_kind
+        self._net_kind = ""
+        if isinstance(result, Exception) or not isinstance(result, int):
+            if kind == "connect":
+                self._stop_net_progress(done=False)
+                if self._net_dlg_lab is not None and self._net_dlg_btns is not None:
+                    self._net_dlg_lab.setText("Could not connect to the network.")
+                    self._net_dlg_btns.show()
+                self._net_session = ""
+            return
+        self.net_lab.setText(f"{result} online")
+        self.net_lab.show()
+        if kind == "connect":
+            self._stop_net_progress(done=True)
+            if self._net_dlg is not None:
+                self._net_dlg.close()
+                self._net_dlg = None
+                self._net_dlg_lab = None
+                self._net_dlg_btns = None
+                self._net_dlg_ship = None
+            self._net_timer.start(network.HEARTBEAT_MS)
 
     def _autostart(self) -> None:
         if self._started or self.worker.running:
@@ -1975,6 +2483,13 @@ class LyraWindow(QMainWindow):
             f"background:{color}; border-radius:5px; border:none;"
         )
         self._paint_channel_regions(txing=on)
+
+    def _set_rig_light(self, on: bool) -> None:
+        color = "#3ddc84" if on else "#888888"
+        self.rig_light.setStyleSheet(
+            f"background:{color}; border-radius:5px; border:none;"
+        )
+        self.rig_light.setToolTip("rig connected" if on else "rig not connected")
 
     def _unmute_tx_channel(self) -> None:
         if self.tx_session.busy:
@@ -2480,11 +2995,18 @@ class LyraWindow(QMainWindow):
         prefs.save_station(self.my_call.text(), self.my_grid.text())
 
     def closeEvent(self, event) -> None:
+        self._net_timer.stop()
+        if self._net_session:
+            network.leave(network.DEFAULT_URL, self._net_session)
+            self._net_session = ""
         self._save_station()
+        self._save_audio()
+        self._save_rig()
         s = prefs.settings()
-        s.setValue("win_geo", self.saveGeometry())
-        s.setValue("win_docks", self.saveState())
-        s.sync()
+        if self._docks_usable():
+            s.setValue("win_geo", self.saveGeometry())
+            s.setValue("win_docks", self.saveState())
+            s.sync()
         self.tx_session.stop()
         try:
             self.rig.disconnect()
@@ -2568,6 +3090,9 @@ QComboBox, QPushButton, QSpinBox, QLineEdit {
     padding: 3px 8px;
     min-height: 20px;
     selection-background-color: @sel;
+}
+QLineEdit::placeholder {
+    color: @muted;
 }
 QPushButton:hover, QComboBox:hover, QSpinBox:hover, QLineEdit:hover {
     background: @hover;
